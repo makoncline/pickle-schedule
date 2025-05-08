@@ -19,7 +19,7 @@ import notification_sender
 import lifetime_registration # Assuming this file exists as per original main_register.py structure
 
 # --- Testing Flag --- 
-RUN_ONCE_FOR_TESTING = True # Set to False for normal continuous operation
+RUN_ONCE_FOR_TESTING = False # Set to False for normal continuous operation
 # ---------------------
 
 # --- Configure Logging --- 
