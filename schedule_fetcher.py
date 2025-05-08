@@ -18,7 +18,7 @@ ALLOWED_WEEKDAY_DAY_PARTS = ["Evening"] # Activities on weekdays must be in one 
 # For weekends, all day parts that pass other filters are implicitly allowed.
 
 # Date range for API query
-DAYS_FROM_NOW_FOR_START_DATE = 7   # Offset from current date for the start of the period. 0 means today.
+DAYS_FROM_NOW_FOR_START_DATE = 1   # Offset from current date for the start of the period. 0 means today.
 FETCH_DURATION_DAYS = 10           # Number of days to fetch data for, including the start date.
 
 def fetch_lifetime_data(jwe_token: str, ssoid_token: str):
