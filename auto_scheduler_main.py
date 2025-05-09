@@ -123,6 +123,20 @@ def main():
         logging.info(f"Discord Webhook URL: Not configured (will skip Discord notifications)")
     logging.info("---------------------")
 
+    # --- Startup Notification ---
+    if DISCORD_WEBHOOK_URL:
+        startup_embed = {
+            "title": "🚀 Lifetime Auto-Scheduler Started",
+            "description": "The scheduling and registration bot has been initialized.",
+            "color": 0x5865F2, # Discord Blurple
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        if discord_notifier.send_discord_notification(embeds=[startup_embed], webhook_url=DISCORD_WEBHOOK_URL):
+            logging.info("Sent startup notification to Discord.")
+        else:
+            logging.warning("Failed to send startup notification to Discord.")
+    # --- End Startup Notification ---
+
     if not MEMBER_IDS_TO_REGISTER or not SMS_RECIPIENT_EMAIL or not EMAIL_SENDER or not EMAIL_PASSWORD:
         logging.critical("Missing one or more required configurations in .env. Exiting.")
         return
@@ -316,6 +330,20 @@ def main():
                                     logging.info(f"Success notification sent for {class_name}.")
                                 else:
                                     logging.warning(f"Failed to send success notification for {class_name}.")
+                                
+                                # --- Discord Notification for Success ---
+                                if DISCORD_WEBHOOK_URL:
+                                    embed_payload_success = {
+                                        "title": f"✅ Successfully Registered: {class_name}",
+                                        "description": f"**Class:** {class_name}\n**Date:** {activity.get('date')} {activity.get('start_time')}\n**Location:** {activity.get('location', 'N/A')}\n**Message:** {reg_message}",
+                                        "color": 0x2ECC71, # Green
+                                        "timestamp": datetime.now(timezone.utc).isoformat()
+                                    }
+                                    if discord_notifier.send_discord_notification(embeds=[embed_payload_success], webhook_url=DISCORD_WEBHOOK_URL):
+                                        logging.info(f"Sent Discord success notification for {class_name}.")
+                                    else:
+                                        logging.warning(f"Failed to send Discord success notification for {class_name}.")
+                                # --- End Discord Notification ---
                                 break # Break from retry loop on success
                             else: # Registration attempt failed
                                 is_fatal_from_api = False
@@ -353,10 +381,23 @@ def main():
                                     logging.warning(f"Ineligible/Fatal API Error for {class_name} ({event_id}): {final_reg_message}. No more retries.")
                                     event_processed_this_cycle = True # Mark as processed
                                     subject = f"NOT Registered (Ineligible/Conflict): {class_name}" # Updated subject
-                                    body = f"Could not register for: {class_name} on {activity.get('date')} {activity.get('start_time')}.
-Reason: {final_reg_message}"
+                                    body = f"Could not register for: {class_name} on {activity.get('date')} {activity.get('start_time')}.\nReason: {final_reg_message}"
                                     if notification_sender.send_sms_notification(body, subject, SMS_RECIPIENT_EMAIL, EMAIL_SENDER, EMAIL_PASSWORD, SMTP_SERVER, SMTP_PORT):
                                         logging.info(f"Ineligibility/conflict notification sent for {class_name}.")
+                                    
+                                    # --- Discord Notification for Fatal/Ineligible Error ---
+                                    if DISCORD_WEBHOOK_URL:
+                                        embed_payload_fatal = {
+                                            "title": f"⚠️ Registration Not Processed: {class_name}",
+                                            "description": f"Could not register for **{class_name}** on {activity.get('date')} {activity.get('start_time')}.\n**Reason:** {final_reg_message}",
+                                            "color": 0xF39C12, # Orange
+                                            "timestamp": datetime.now(timezone.utc).isoformat()
+                                        }
+                                        if discord_notifier.send_discord_notification(embeds=[embed_payload_fatal], webhook_url=DISCORD_WEBHOOK_URL):
+                                            logging.info(f"Sent Discord fatal/ineligible notification for {class_name}.")
+                                        else:
+                                            logging.warning(f"Failed to send Discord fatal/ineligible notification for {class_name}.")
+                                    # --- End Discord Notification ---
                                     break # Break from retry loop
                                 else: # Non-fatal, retryable error
                                     logging.warning(f"FAILED Attempt {retry_count + 1}/{MAX_REGISTRATION_RETRIES} for {class_name} ({event_id}). Msg: {final_reg_message}")
@@ -372,6 +413,20 @@ Reason: {final_reg_message}"
                             body = f"Failed to register for: {class_name} on {activity.get('date')} {activity.get('start_time')} after attempts.\nLast error: {final_reg_message}"
                             if notification_sender.send_sms_notification(body, subject, SMS_RECIPIENT_EMAIL, EMAIL_SENDER, EMAIL_PASSWORD, SMTP_SERVER, SMTP_PORT):
                                 logging.info(f"Final failure notification sent for {class_name}.")
+                            
+                            # --- Discord Notification for Failure after Retries ---
+                            if DISCORD_WEBHOOK_URL:
+                                embed_payload_failure = {
+                                    "title": f"❌ Registration Failed: {class_name}",
+                                    "description": f"Failed to register for **{class_name}** on {activity.get('date')} {activity.get('start_time')} after {retry_count if retry_count > 0 else MAX_REGISTRATION_RETRIES} attempts.\n**Last Error:** {final_reg_message}",
+                                    "color": 0xE74C3C, # Red
+                                    "timestamp": datetime.now(timezone.utc).isoformat()
+                                }
+                                if discord_notifier.send_discord_notification(embeds=[embed_payload_failure], webhook_url=DISCORD_WEBHOOK_URL):
+                                    logging.info(f"Sent Discord failure after retries notification for {class_name}.")
+                                else:
+                                    logging.warning(f"Failed to send Discord failure after retries notification for {class_name}.")
+                            # --- End Discord Notification ---
                         
                         if event_processed_this_cycle:
                             processed_event_ids.add(event_id)
