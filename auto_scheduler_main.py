@@ -6,33 +6,73 @@ import os
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import logging # Import logging
+import pytz # Added for timezone conversion
 
 # --- Project Modules ---
 import schedule_fetcher
 # Assuming lifetime_auth.py contains perform_login directly
 from lifetime_auth import perform_login 
 import registration_handler
-import notification_sender
 import discord_notifier # Added for Discord notifications
 
 # It's good practice to also import the lifetime_registration module here if it's needed by registration_handler
 # and not handled internally by it. Based on registration_handler.py, it expects the module to be passed.
 import lifetime_registration # Assuming this file exists as per original main_register.py structure
 
+# --- Timezone Configuration ---
+MOUNTAIN_TZ = pytz.timezone('America/Denver')
+
+# --- Helper Function for Timedelta Formatting ---
+def format_timedelta_to_human_readable(delta):
+    """Converts a timedelta object to a human-readable string like '2d 3h 5m' or 'Window Open/Passed'."""
+    if delta.total_seconds() <= 0:
+        return "Window Open/Passed"
+
+    days = delta.days
+    hours, remainder = divmod(delta.seconds, 3600)
+    minutes, _ = divmod(remainder, 60)
+
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0 or (days == 0 and hours == 0): # Show minutes if it's the smallest unit or only unit
+        parts.append(f"{minutes}m")
+    
+    return " ".join(parts) if parts else "Now"
+
+# --- Custom Logging Formatter for Mountain Time ---
+class MountainTimeFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, timezone.utc)
+        dt_mt = dt.astimezone(MOUNTAIN_TZ)
+        if datefmt:
+            s = dt_mt.strftime(datefmt)
+        else:
+            try:
+                s = dt_mt.isoformat(timespec='milliseconds')
+            except TypeError:
+                s = dt_mt.isoformat()
+        return s
+
+# --- Configure Logging --- 
+# Place this near the top, after imports and MOUNTAIN_TZ definition
+log_formatter = MountainTimeFormatter(
+    fmt='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
+    datefmt='%Y-%m-%d %I:%M:%S %p %Z' # Changed to AM/PM
+)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[console_handler]
+)
+
 # --- Testing Flag --- 
 RUN_ONCE_FOR_TESTING = False # Set to False for normal continuous operation
 # ---------------------
-
-# --- Configure Logging --- 
-# Place this near the top, after imports
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
-    handlers=[
-        logging.StreamHandler()  # Log to console
-        # TODO: Consider adding logging.FileHandler('scheduler.log') later
-    ]
-)
 
 # --- Load Environment Variables --- 
 load_dotenv() # Load variables from .env file into environment
@@ -55,48 +95,156 @@ else:
     exit()
 
 # Notification Config - (Ensure these are set in your .env file)
-SMS_RECIPIENT_EMAIL = os.getenv("SMS_RECIPIENT_EMAIL") # e.g., "1234567890@vtext.com"
-EMAIL_SENDER = os.getenv("EMAIL_SENDER_ADDRESS")      # Gmail address for sending
-EMAIL_PASSWORD = os.getenv("EMAIL_SENDER_PASSWORD")    # Gmail app password
-# Optional: Override SMTP server/port if not using Gmail defaults
-SMTP_SERVER = os.getenv("SMTP_SERVER", notification_sender.DEFAULT_SMTP_SERVER)
-SMTP_PORT = int(os.getenv("SMTP_PORT", notification_sender.DEFAULT_SMTP_PORT))
 # ---- Add DISCORD_WEBHOOK_URL to your .env file for Discord notifications ----
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL") 
 
 # Timing Config
 REGISTRATION_OPEN_MINUTES_BEFORE_EVENT = 11400  # As per user spec
 SCHEDULE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60    # 24 hours
-REGISTRATION_ATTEMPT_CHECK_INTERVAL_SECONDS = 1 # Changed from 5 * 60 to 1 second
+# REGISTRATION_ATTEMPT_CHECK_INTERVAL_SECONDS = 1 # Replaced by dynamic sleep
+# --- New Windowed Registration Attempt Config ---
+REGISTRATION_ATTEMPT_LEAD_TIME_SECONDS = 5  # How many seconds before official open time to start first attempt
+REGISTRATION_ATTEMPT_DURATION_SECONDS = 30 # Total duration for active registration attempts
+REGISTRATION_RETRY_INTERVAL_WITHIN_WINDOW_SECONDS = 2 # Interval between attempts within the active window
+CATCH_UP_ATTEMPT_DURATION_SECONDS = 10 # Duration to attempt if ideal window already passed for a new event
+
+# --- Dynamic Sleep Configuration ---
+MIN_SLEEP_INTERVAL_S = 1.0  # Minimum sleep time in seconds
+DEFAULT_MAX_SLEEP_INTERVAL_S = 15 * 60.0  # Default maximum sleep time (e.g., 15 minutes)
+INITIAL_FETCH_RETRY_INTERVAL_S = 60.0    # Sleep time if initial login/fetch fails (e.g., 60 seconds)
 
 # State Management
 PROCESSED_EVENTS_FILE = "processed_event_ids.json"
-processed_event_ids = set()
-MAX_REGISTRATION_RETRIES = 5
-REGISTRATION_RETRY_DELAY_SECONDS = 2
+processed_event_id_set = set() # Renamed from processed_event_ids
+processed_event_details_list = [] # New list to store detailed records
+# MAX_REGISTRATION_RETRIES = 5 # Replaced by windowed attempt logic
+# REGISTRATION_RETRY_DELAY_SECONDS = 2 # Replaced by REGISTRATION_RETRY_INTERVAL_WITHIN_WINDOW_SECONDS
 
 def load_processed_events():
-    """Loads the set of processed event IDs from a file."""
-    global processed_event_ids
+    """Loads processed event records from a file.
+    Populates processed_event_id_set for quick lookups and
+    processed_event_details_list for storing/saving detailed records.
+    """
+    global processed_event_id_set, processed_event_details_list
+    processed_event_id_set = set()    # Initialize
+    processed_event_details_list = [] # Initialize
+
     try:
         if os.path.exists(PROCESSED_EVENTS_FILE):
             with open(PROCESSED_EVENTS_FILE, 'r') as f:
-                processed_event_ids = set(json.load(f))
-            logging.info(f"Loaded {len(processed_event_ids)} processed event IDs from {PROCESSED_EVENTS_FILE}")
+                data = json.load(f)
+            
+            if isinstance(data, list):
+                if all(isinstance(item, dict) for item in data): # New format: list of dicts
+                    processed_event_details_list = data
+                    for item in processed_event_details_list:
+                        if 'event_id' in item and item.get('status') != "SKIPPED_WINDOW_ALREADY_PASSED": # Ensure not to add this status back if it was somehow there
+                            processed_event_id_set.add(item['event_id'])
+                    logging.info(f"Loaded {len(processed_event_details_list)} detailed processed event records from {PROCESSED_EVENTS_FILE}.")
+                elif all(isinstance(item, str) for item in data): # Old format: list of strings
+                    processed_event_id_set = set(data)
+                    # Convert old format to minimal new format entries
+                    for old_event_id in processed_event_id_set:
+                        # Check if a detailed record might already exist from a partial previous conversion (unlikely but safe)
+                        if not any(d.get('event_id') == old_event_id for d in processed_event_details_list):
+                            minimal_record = {
+                                "event_id": old_event_id,
+                                "class_name": "N/A (Old Record)",
+                                "event_datetime_mt": "N/A",
+                                "registration_opens_mt": "N/A",
+                                "status": "IMPORTED_OLD_FORMAT",
+                                "message": "Event ID imported from previous plain list format.",
+                                "processed_timestamp_mt": datetime.now(timezone.utc).astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M:%S %p %Z')
+                            }
+                            processed_event_details_list.append(minimal_record)
+                    logging.info(f"Loaded {len(processed_event_id_set)} event IDs from old format in {PROCESSED_EVENTS_FILE}. Converted to minimal detailed records. File will be updated to new format on save.")
+                else: # Mixed or unknown list content
+                    logging.warning(f"{PROCESSED_EVENTS_FILE} contains a list with mixed or unknown item types. Starting with empty processed records.")
+            else: # Not a list
+                logging.warning(f"{PROCESSED_EVENTS_FILE} does not contain a list. Starting with empty processed records.")
         else:
-            logging.info(f"{PROCESSED_EVENTS_FILE} not found. Starting with an empty set of processed events.")
+            logging.info(f"{PROCESSED_EVENTS_FILE} not found. Starting with empty processed records.")
     except (json.JSONDecodeError, IOError) as e:
-        logging.error(f"Error loading {PROCESSED_EVENTS_FILE}: {e}. Starting fresh.")
-        processed_event_ids = set()
+        logging.error(f"Error loading or parsing {PROCESSED_EVENTS_FILE}: {e}. Starting fresh.")
+        processed_event_id_set = set()
+        processed_event_details_list = []
 
 def save_processed_events():
-    """Saves the current set of processed event IDs to a file."""
+    """Saves the current list of detailed processed event records to a file."""
+    global processed_event_details_list
     try:
         with open(PROCESSED_EVENTS_FILE, 'w') as f:
-            json.dump(list(processed_event_ids), f) # Convert set to list for JSON serialization
-        logging.debug(f"Saved {len(processed_event_ids)} processed event IDs to {PROCESSED_EVENTS_FILE}") # Debug level for frequent saves
+            json.dump(processed_event_details_list, f, indent=4) # Save the list of dicts with indent
+        logging.debug(f"Saved {len(processed_event_details_list)} detailed processed event records to {PROCESSED_EVENTS_FILE}")
     except IOError as e:
-        logging.error(f"Error saving processed events to {PROCESSED_EVENTS_FILE}: {e}")
+        logging.error(f"Error saving detailed processed events to {PROCESSED_EVENTS_FILE}: {e}")
+
+# --- Helper function to add event to processed records ---
+def _add_event_to_processed_records(event_id, class_name, activity_data, status, message, attempts_in_window=None):
+    global processed_event_details_list, processed_event_id_set
+
+    # Try to find an existing record to update
+    existing_record = None
+    for record_item in processed_event_details_list:
+        if record_item.get('event_id') == event_id:
+            existing_record = record_item
+            break
+
+    current_timestamp_mt = datetime.now(timezone.utc).astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M:%S %p %Z')
+
+    if existing_record:
+        logging.debug(f"Updating existing detailed record for event {event_id} ({class_name}). Old status: {existing_record.get('status')}, New status: {status}")
+        existing_record["class_name"] = class_name # Update class name in case it changed (unlikely for same ID but good practice)
+        existing_record["status"] = status
+        existing_record["message"] = message
+        existing_record["processed_timestamp_mt"] = current_timestamp_mt
+        if attempts_in_window is not None:
+            existing_record["attempts_made_in_window"] = attempts_in_window
+        else:
+            # If new status doesn't imply attempts, remove the key if it exists from a previous status
+            existing_record.pop("attempts_made_in_window", None)
+        
+        # Ensure event/reg times are present or updated if they were N/A
+        if existing_record.get("event_datetime_mt", "N/A") == "N/A" or existing_record.get("registration_opens_mt", "N/A") == "N/A":
+            try:
+                start_ts_ms_upd = int(activity_data.get("start_timestamp"))
+                event_start_utc_upd = datetime.fromtimestamp(start_ts_ms_upd / 1000, timezone.utc)
+                existing_record["event_datetime_mt"] = event_start_utc_upd.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+                reg_opens_utc_upd = event_start_utc_upd - timedelta(minutes=REGISTRATION_OPEN_MINUTES_BEFORE_EVENT)
+                existing_record["registration_opens_mt"] = reg_opens_utc_upd.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+            except (ValueError, TypeError, AttributeError) as e_upd:
+                logging.warning(f"Could not format event/reg times while updating record for {event_id}: {e_upd}")
+    else:
+        logging.debug(f"Adding new detailed record for event {event_id} ({class_name}). Status: {status}")
+        event_start_mt_str = "N/A"
+        reg_opens_mt_str = "N/A"
+        try:
+            start_ts_ms = int(activity_data.get("start_timestamp"))
+            event_start_utc = datetime.fromtimestamp(start_ts_ms / 1000, timezone.utc)
+            event_start_mt_str = event_start_utc.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+            
+            reg_opens_utc = event_start_utc - timedelta(minutes=REGISTRATION_OPEN_MINUTES_BEFORE_EVENT)
+            reg_opens_mt_str = reg_opens_utc.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+        except (ValueError, TypeError, AttributeError) as e:
+            logging.warning(f"Could not format event/reg times for new processed record of {event_id} ({class_name}): {e}")
+
+        new_record = {
+            "event_id": event_id,
+            "class_name": class_name,
+            "event_datetime_mt": event_start_mt_str,
+            "registration_opens_mt": reg_opens_mt_str,
+            "status": status,
+            "message": message,
+            "processed_timestamp_mt": current_timestamp_mt
+        }
+        if attempts_in_window is not None:
+            new_record["attempts_made_in_window"] = attempts_in_window
+        processed_event_details_list.append(new_record)
+
+    processed_event_id_set.add(event_id) # Crucial to keep the set in sync for quick lookups
+    
+    save_processed_events() # Save immediately after adding/updating a record
+    logging.info(f"Event {event_id} ({class_name}) processed. Status: {status}. Record saved/updated.")
 
 
 def main():
@@ -110,13 +258,13 @@ def main():
     # Test: print loaded configs
     logging.info("--- Configuration ---")
     logging.info(f"Member IDs to Register: {MEMBER_IDS_TO_REGISTER}")
-    logging.info(f"SMS Recipient: {SMS_RECIPIENT_EMAIL}")
-    logging.info(f"Email Sender: {EMAIL_SENDER}")
     logging.info(f"Reg Open Minutes Before: {REGISTRATION_OPEN_MINUTES_BEFORE_EVENT}")
     logging.info(f"Schedule Check Interval (s): {SCHEDULE_CHECK_INTERVAL_SECONDS}")
-    logging.info(f"Reg Attempt Interval (s): {REGISTRATION_ATTEMPT_CHECK_INTERVAL_SECONDS}")
-    logging.info(f"Max Reg Retries: {MAX_REGISTRATION_RETRIES}")
-    logging.info(f"Reg Retry Delay (s): {REGISTRATION_RETRY_DELAY_SECONDS}")
+    # logging.info(f"Reg Attempt Interval (s): {REGISTRATION_ATTEMPT_CHECK_INTERVAL_SECONDS}")
+    logging.info(f"Reg Attempt Lead Time (s): {REGISTRATION_ATTEMPT_LEAD_TIME_SECONDS}")
+    logging.info(f"Reg Attempt Duration (s): {REGISTRATION_ATTEMPT_DURATION_SECONDS}")
+    logging.info(f"Reg Retry Interval in Window (s): {REGISTRATION_RETRY_INTERVAL_WITHIN_WINDOW_SECONDS}")
+    logging.info(f"Catch-up Attempt Duration (s): {CATCH_UP_ATTEMPT_DURATION_SECONDS}")
     if DISCORD_WEBHOOK_URL:
         logging.info(f"Discord Webhook URL: Configured (will send notifications)")
     else:
@@ -129,7 +277,7 @@ def main():
             "title": "🚀 Lifetime Auto-Scheduler Started",
             "description": "The scheduling and registration bot has been initialized.",
             "color": 0x5865F2, # Discord Blurple
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "timestamp": datetime.now(timezone.utc).astimezone(MOUNTAIN_TZ).isoformat()
         }
         if discord_notifier.send_discord_notification(embeds=[startup_embed], webhook_url=DISCORD_WEBHOOK_URL):
             logging.info("Sent startup notification to Discord.")
@@ -137,8 +285,8 @@ def main():
             logging.warning("Failed to send startup notification to Discord.")
     # --- End Startup Notification ---
 
-    if not MEMBER_IDS_TO_REGISTER or not SMS_RECIPIENT_EMAIL or not EMAIL_SENDER or not EMAIL_PASSWORD:
-        logging.critical("Missing one or more required configurations in .env. Exiting.")
+    if not MEMBER_IDS_TO_REGISTER:
+        logging.critical("Missing LIFETIME_MEMBER_IDS in .env. Exiting.")
         return
 
     # Initialize variables for the main loop
@@ -150,9 +298,43 @@ def main():
         while True:
             now_timestamp = time.time()
             now_utc_datetime = datetime.now(timezone.utc)
-            current_datetime_str = now_utc_datetime.strftime("%Y-%m-%d %H:%M:%S %Z")
+            current_datetime_mt_str = now_utc_datetime.astimezone(MOUNTAIN_TZ).strftime("%Y-%m-%d %I:%M:%S %p %Z")
 
-            logging.info(f"Main loop iteration starting...") # Removed newline for cleaner logs
+            log_message_parts = [f"Main loop iteration starting at {current_datetime_mt_str}."]
+            
+            registration_queue_logging = []
+            if current_schedule_activities: # Only build queue if there are activities
+                for activity_detail in current_schedule_activities:
+                    event_id_detail = activity_detail.get("id")
+                    if event_id_detail not in processed_event_id_set:
+                        class_name_q = activity_detail.get('class_name', 'N/A')
+                        event_start_str_q_mt = "N/A"
+                        reg_opens_str_q_mt = "N/A"
+                        time_until_reg_str = "N/A"
+                        try:
+                            start_ts_ms_str = activity_detail.get("start_timestamp")
+                            if start_ts_ms_str:
+                                start_dt_utc_q = datetime.fromtimestamp(int(start_ts_ms_str) / 1000, timezone.utc)
+                                event_start_str_q_mt = start_dt_utc_q.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+                                
+                                reg_opens_dt_utc_q = start_dt_utc_q - timedelta(minutes=REGISTRATION_OPEN_MINUTES_BEFORE_EVENT)
+                                reg_opens_str_q_mt = reg_opens_dt_utc_q.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+                                
+                                # Calculate time until registration opens
+                                time_delta_to_reg = reg_opens_dt_utc_q - now_utc_datetime
+                                time_until_reg_str = format_timedelta_to_human_readable(time_delta_to_reg)
+                                
+                        except (ValueError, TypeError) as e_q_time:
+                            logging.debug(f"Error formatting time for queue log (event {event_id_detail}): {e_q_time}")
+                        registration_queue_logging.append(f"  - {class_name_q} ({event_id_detail}) | Event: {event_start_str_q_mt} | Reg. Opens: {reg_opens_str_q_mt} | Until Reg: {time_until_reg_str}")
+            
+            if registration_queue_logging:
+                log_message_parts.append(f"Upcoming Registrations ({len(registration_queue_logging)} items):") # Changed title
+                log_message_parts.extend(registration_queue_logging)
+            else:
+                log_message_parts.append("Upcoming Registrations: Empty.") # Changed title
+            
+            logging.info("\n".join(log_message_parts))
 
             schedule_fetched_this_iteration = False
             if (now_timestamp - last_schedule_fetch_time) > SCHEDULE_CHECK_INTERVAL_SECONDS or last_schedule_fetch_time == 0:
@@ -163,12 +345,12 @@ def main():
                 jwe_token, ssoid_token = perform_login() 
                 
                 if not jwe_token or not ssoid_token:
-                    logging.warning(f"Login failed. Cannot fetch schedule. Will retry in {REGISTRATION_ATTEMPT_CHECK_INTERVAL_SECONDS}s.")
-                    if RUN_ONCE_FOR_TESTING and last_schedule_fetch_time == 0: # If run_once and login fails on very first try
+                    logging.warning(f"Login failed. Cannot fetch schedule. Will retry shortly.")
+                    if RUN_ONCE_FOR_TESTING and last_schedule_fetch_time == 0:
                         logging.error("Login failed on first attempt in RUN_ONCE_FOR_TESTING mode. Exiting.")
-                        break # Exit the while True loop
-                    time.sleep(REGISTRATION_ATTEMPT_CHECK_INTERVAL_SECONDS)
-                    continue # Skip to next iteration of the main loop to retry login and fetch
+                        break
+                    time.sleep(INITIAL_FETCH_RETRY_INTERVAL_S)
+                    continue
                 
                 logging.info(f"Login successful. Fetching schedule...")
                 fetched_activities = schedule_fetcher.get_filtered_schedule(jwe_token, ssoid_token)
@@ -180,81 +362,117 @@ def main():
                         logging.debug("First few activities for review:") # Debug for less critical info
                         for i, act in enumerate(current_schedule_activities[:3]): # Print first 3
                             logging.debug(f"  - {act.get('date')} {act.get('start_time')}: {act.get('class_name')}")
-                    last_schedule_fetch_time = now_timestamp # Update time only on successful fetch
+                    last_schedule_fetch_time = now_timestamp
+                    schedule_fetched_this_iteration = True
                     
                     # --- Start Discord Notification Block for Fetched Schedule ---
-                    if DISCORD_WEBHOOK_URL and current_schedule_activities and schedule_fetched_this_iteration:
+                    if DISCORD_WEBHOOK_URL and current_schedule_activities: # Removed schedule_fetched_this_iteration check here as it's now always true if we get here
                         discord_embed_lines = []
-                        for activity_detail in current_schedule_activities: # Iterate over ALL fetched activities
-                            class_name = activity_detail.get('class_name','N/A')
-                            activity_date_str = activity_detail.get('date', 'N/A') 
-                            start_time_str = activity_detail.get('start_time', 'N/A') 
+                        for activity_detail in current_schedule_activities: 
+                            event_id_disc = activity_detail.get('id', 'N/A')
+                            if event_id_disc in processed_event_id_set: # Use renamed set
+                                continue # Skip already processed events
+
+                            class_name_disc = activity_detail.get('class_name','N/A')
+                            # event_id_disc is already defined above
                             
-                            reg_opens_display_str = "N/A"
+                            event_start_str_disc_mt = "N/A"
+                            reg_opens_display_str_disc_mt = "N/A"
+                            time_until_reg_disc_str = "N/A"
+
                             try:
-                                start_ts_ms_str = activity_detail.get("start_timestamp")
-                                if start_ts_ms_str is not None:
-                                    start_dt_utc = datetime.fromtimestamp(int(start_ts_ms_str) / 1000, timezone.utc)
-                                    reg_opens_dt_utc = start_dt_utc - timedelta(minutes=REGISTRATION_OPEN_MINUTES_BEFORE_EVENT)
-                                    # Format: e.g., "Mon Jan 01, 15:30 UTC"
-                                    reg_opens_display_str = reg_opens_dt_utc.strftime('%a %b %d, %H:%M %Z') 
+                                start_ts_ms_str_disc = activity_detail.get("start_timestamp")
+                                if start_ts_ms_str_disc is not None:
+                                    start_dt_utc_disc = datetime.fromtimestamp(int(start_ts_ms_str_disc) / 1000, timezone.utc)
+                                    event_start_str_disc_mt = start_dt_utc_disc.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+                                    
+                                    reg_opens_dt_utc_disc = start_dt_utc_disc - timedelta(minutes=REGISTRATION_OPEN_MINUTES_BEFORE_EVENT)
+                                    reg_opens_display_str_disc_mt = reg_opens_dt_utc_disc.astimezone(MOUNTAIN_TZ).strftime('%a %b %d, %I:%M %p %Z')
+                                    
+                                    # Calculate time until registration for Discord message
+                                    # now_utc_datetime is available from the start of the main loop iteration
+                                    time_delta_to_reg_disc = reg_opens_dt_utc_disc - now_utc_datetime
+                                    time_until_reg_disc_str = format_timedelta_to_human_readable(time_delta_to_reg_disc)
                                 else:
-                                    logging.warning(f"Missing start_timestamp for activity ID {activity_detail.get('id')} when creating Discord msg.")
-                            except (ValueError, TypeError, AttributeError) as e_time:
-                                logging.warning(f"Could not parse/format registration time for Discord msg for activity ID {activity_detail.get('id')}: {e_time}")
+                                    logging.warning(f"Missing start_timestamp for Discord msg (event ID {event_id_disc}).")
+                            except (ValueError, TypeError, AttributeError) as e_disc_time:
+                                logging.warning(f"Could not parse/format reg time for Discord msg (event ID {event_id_disc}): {e_disc_time}")
+                            
+                            # Constructing the line similar to the detailed log format
+                            line_parts = [
+                                f"- **{class_name_disc}** ({event_id_disc})",
+                                f"  - Starts: {event_start_str_disc_mt}",
+                                f"  - Reg. Opens: {reg_opens_display_str_disc_mt} (Until Reg: {time_until_reg_disc_str})"
+                            ]
+                            discord_embed_lines.append("\n".join(line_parts)) # Join parts for a multi-line entry per class
 
-                            discord_embed_lines.append(f"- **{class_name}**")
-                            discord_embed_lines.append(f"  - Class Time: {activity_date_str} {start_time_str}")
-                            discord_embed_lines.append(f"  - Reg. Opens: {reg_opens_display_str}")
+                        if discord_embed_lines: # Only send if there are new (unprocessed) classes
+                            embed_title_disc = f"🗓️ Schedule Update: {len(discord_embed_lines)} New Classes Fetched"
+                            description_header_disc = "The latest schedule fetch includes the following new classes:\\n"
+                            
+                            full_description_disc = description_header_disc + "\n".join(discord_embed_lines)
+                            
+                            if len(full_description_disc) > 4000: # Discord embed description limit is 4096
+                                full_description_disc = full_description_disc[:4000] + "\n... (message truncated due to length)"
 
-                        embed_title = f"🗓️ Schedule Update: {len(current_schedule_activities)} Classes Fetched"
-                        description_header = "The latest schedule fetch includes the following classes:\n\n"
-                        
-                        full_description = description_header + "\n".join(discord_embed_lines)
-                        
-                        if len(full_description) > 4000: # Discord embed description limit is 4096
-                            full_description = full_description[:4000] + "\n... (message truncated due to length)"
-
-                        discord_embed_payload = {
-                            "title": embed_title,
-                            "description": full_description,
-                            "color": 0x1ABC9C, # A pleasant green color (decimal)
-                            "timestamp": datetime.now(timezone.utc).isoformat()
-                        }
-                        
-                        if discord_notifier.send_discord_notification(embeds=[discord_embed_payload], webhook_url=DISCORD_WEBHOOK_URL):
-                            logging.info(f"Sent Discord notification for {len(current_schedule_activities)} fetched classes.")
+                            discord_embed_payload = {
+                                "title": embed_title_disc,
+                                "description": full_description_disc,
+                                "color": 0x1ABC9C, # A pleasant green color (decimal)
+                                "timestamp": datetime.now(timezone.utc).astimezone(MOUNTAIN_TZ).isoformat()
+                            }
+                            
+                            if discord_notifier.send_discord_notification(embeds=[discord_embed_payload], webhook_url=DISCORD_WEBHOOK_URL):
+                                logging.info(f"Sent Discord notification for {len(discord_embed_lines)} new fetched classes.")
+                            else:
+                                logging.warning(f"Failed to send Discord notification for {len(discord_embed_lines)} new fetched classes.")
                         else:
-                            logging.warning(f"Failed to send Discord notification for {len(current_schedule_activities)} fetched classes.")
+                            logging.info("Schedule fetched, but all activities were already processed or filtered out. No 'Schedule Update' Discord notification sent.")
                     # --- End Discord Notification Block ---
 
-                    logging.info("--- Upcoming Monitored Classes (Registration Times UTC) ---")
+                    logging.info("--- Upcoming Monitored Classes (Registration Times in Mountain Time) ---")
                     monitored_count = 0
                     for activity_detail in current_schedule_activities:
-                        event_id_detail = activity_detail.get("id")
-                        if event_id_detail in processed_event_ids:
-                            continue # Skip already processed
+                        event_id_detail_mon = activity_detail.get("id")
+                        if event_id_detail_mon in processed_event_id_set: # Use renamed set
+                            continue
                         monitored_count += 1
-                        start_ts_ms_str = activity_detail.get("start_timestamp")
+                        class_name_mon = activity_detail.get('class_name','N/A')
+                        start_dt_mt_str = "N/A"
+                        reg_opens_dt_mt_str = "N/A"
+                        time_until_reg_mon_str = "N/A"
                         try:
-                            start_dt_utc = datetime.fromtimestamp(int(start_ts_ms_str) / 1000, timezone.utc)
-                            reg_opens_dt_utc = start_dt_utc - timedelta(minutes=REGISTRATION_OPEN_MINUTES_BEFORE_EVENT)
-                            logging.info(f"  Watching: {activity_detail.get('class_name','N/A')} ({event_id_detail}) | Starts: {start_dt_utc.strftime('%Y-%m-%d %H:%M')} | Reg Opens: {reg_opens_dt_utc.strftime('%Y-%m-%d %H:%M')}")
+                            start_ts_ms_str_mon = activity_detail.get("start_timestamp")
+                            if start_ts_ms_str_mon:
+                                start_dt_utc_mon = datetime.fromtimestamp(int(start_ts_ms_str_mon) / 1000, timezone.utc)
+                                start_dt_mt_str = start_dt_utc_mon.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+                                
+                                reg_opens_dt_utc_mon = start_dt_utc_mon - timedelta(minutes=REGISTRATION_OPEN_MINUTES_BEFORE_EVENT)
+                                reg_opens_dt_mt_str = reg_opens_dt_utc_mon.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+                                
+                                # Calculate time until registration for monitored classes
+                                time_delta_to_reg_mon = reg_opens_dt_utc_mon - now_utc_datetime # now_utc_datetime is from the start of the current main loop iteration
+                                time_until_reg_mon_str = format_timedelta_to_human_readable(time_delta_to_reg_mon)
+                                
+                            logging.info(f"  Watching: {class_name_mon} ({event_id_detail_mon}) | Starts: {start_dt_mt_str} | Reg Opens: {reg_opens_dt_mt_str} | Until Reg: {time_until_reg_mon_str}")
                         except (ValueError, TypeError):
-                            logging.warning(f"  Could not parse start_timestamp for an activity: {activity_detail.get('class_name','N/A')} ({event_id_detail})")
+                            logging.warning(f"  Could not parse/format times for monitored class: {class_name_mon} ({event_id_detail_mon})")
                     if monitored_count == 0:
-                        logging.info("  No new activities to monitor from this schedule fetch (all may be processed or schedule empty).")
+                        logging.info("  No new activities to monitor (all may be processed or schedule empty).")
                     logging.info("----------------------------------------------------------")
-                    schedule_fetched_this_iteration = True
                 else:
-                    logging.warning(f"Failed to fetch schedule. Will retry in {REGISTRATION_ATTEMPT_CHECK_INTERVAL_SECONDS}s.")
-                    if RUN_ONCE_FOR_TESTING and last_schedule_fetch_time == 0: # If run_once and fetch fails on very first try
-                        logging.error("Schedule fetch failed on first attempt in RUN_ONCE_FOR_TESTING mode. Exiting.")
-                        break # Exit the while True loop
-                    time.sleep(REGISTRATION_ATTEMPT_CHECK_INTERVAL_SECONDS)
+                    logging.warning(f"Failed to fetch schedule. Will retry shortly.")
+                    schedule_fetched_this_iteration = False # Ensure it's false if fetch failed
+                    if RUN_ONCE_FOR_TESTING and last_schedule_fetch_time == 0:
+                        logging.error("Schedule fetch failed on first attempt (RUN_ONCE_FOR_TESTING). Exiting.")
+                        break
+                    time.sleep(INITIAL_FETCH_RETRY_INTERVAL_S)
                     continue
             else:
-                logging.debug(f"Not time to fetch new schedule yet. Last fetch: {datetime.fromtimestamp(last_schedule_fetch_time if last_schedule_fetch_time > 0 else 0).strftime('%Y-%m-%d %H:%M:%S')}")
+                # If not fetching schedule, ensure this is False so Discord notification for new schedule doesn't re-trigger without a new fetch.
+                schedule_fetched_this_iteration = False 
+                last_fetch_dt_mt_str = datetime.fromtimestamp(last_schedule_fetch_time if last_schedule_fetch_time > 0 else 0).astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+                logging.debug(f"Not time to fetch new schedule. Last fetch: {last_fetch_dt_mt_str}")
 
             # --- Step 9: Registration Logic (Frequent Checks) ---
             if not current_schedule_activities:
@@ -268,7 +486,7 @@ def main():
                     class_name = activity.get("class_name", "Unknown Class")
                     logging.debug(f"Evaluating: {class_name} ({event_id})") # Log which class is being checked
 
-                    if event_id in processed_event_ids:
+                    if event_id in processed_event_id_set: # Use renamed set
                         logging.debug(f"  Skipping already processed event: {class_name} ({event_id})")
                         continue
                     
@@ -276,170 +494,232 @@ def main():
                         start_timestamp_ms = int(activity.get("start_timestamp"))
                         # Convert milliseconds to seconds for datetime
                         event_start_datetime_utc = datetime.fromtimestamp(start_timestamp_ms / 1000, timezone.utc)
-                    except ValueError:
+                    except (ValueError, TypeError): # Added TypeError for None if get() returns None and int() fails
                         logging.error(f"Error parsing start_timestamp for {class_name} ({event_id}). Value: {activity.get('start_timestamp')}. Skipping.")
                         continue
 
                     registration_opens_datetime_utc = event_start_datetime_utc - timedelta(minutes=REGISTRATION_OPEN_MINUTES_BEFORE_EVENT)
                     
-                    # For debugging time comparisons:
-                    # print(f"[{current_datetime_str}] Event: {class_name} ({event_id})")
-                    # print(f"    Event Start UTC: {event_start_datetime_utc.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                    # print(f"    Reg Opens UTC:   {registration_opens_datetime_utc.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                    # print(f"    Current UTC:     {now_utc_datetime[0].strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                    # --- New Windowed Attempt Logic ---
+                    attempt_window_start_utc = registration_opens_datetime_utc - timedelta(seconds=REGISTRATION_ATTEMPT_LEAD_TIME_SECONDS)
+                    attempt_window_end_utc = attempt_window_start_utc + timedelta(seconds=REGISTRATION_ATTEMPT_DURATION_SECONDS)
+                    
+                    current_processing_time_utc = datetime.now(timezone.utc) # Get current time for this event's evaluation
 
-                    if now_utc_datetime >= registration_opens_datetime_utc:
-                        logging.info(f">>> Registration window OPEN for: {class_name} ({event_id}) at {activity.get('date')} {activity.get('start_time')} <<< ")
+                    if current_processing_time_utc < attempt_window_start_utc:
+                        # Not yet time to start trying for this one. Dynamic sleep will handle waking up.
+                        attempt_window_start_mt_str = attempt_window_start_utc.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M:%S %p %Z')
+                        logging.debug(f"  Attempt window for {class_name} ({event_id}) not yet open. Starts: {attempt_window_start_mt_str}")
+                        continue
+
+                    # If we reach here, it means: current_processing_time_utc >= attempt_window_start_utc
+                    # So, it's time for lead-in, or official open, or past official open. We should attempt.
+
+                    # Determine the actual end time for our attempt loop for this event, this cycle.
+                    ideal_attempt_window_end_utc = attempt_window_start_utc + timedelta(seconds=REGISTRATION_ATTEMPT_DURATION_SECONDS)
+                    current_loop_attempt_window_end_utc = ideal_attempt_window_end_utc
+                    active_window_duration_for_message = REGISTRATION_ATTEMPT_DURATION_SECONDS
+                    window_type_log_msg = "ideal"
+
+                    if current_processing_time_utc >= ideal_attempt_window_end_utc:
+                        # Ideal window has passed. This is a catch-up scenario for a (likely) newly seen event.
+                        current_loop_attempt_window_end_utc = current_processing_time_utc + timedelta(seconds=CATCH_UP_ATTEMPT_DURATION_SECONDS)
+                        active_window_duration_for_message = CATCH_UP_ATTEMPT_DURATION_SECONDS
+                        window_type_log_msg = "catch-up"
+                        logging.info(f"Ideal attempt window for {class_name} ({event_id}) has passed. Initiating {window_type_log_msg} attempts.")
+
+                    activity_date_mt = event_start_datetime_utc.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d')
+                    activity_time_mt = event_start_datetime_utc.astimezone(MOUNTAIN_TZ).strftime('%I:%M %p %Z')
+                    loop_attempt_window_end_mt_str = current_loop_attempt_window_end_utc.astimezone(MOUNTAIN_TZ).strftime('%I:%M:%S %p %Z')
+                    logging.info(f">>> Active registration attempt window ({window_type_log_msg}) for: {class_name} ({event_id}) at {activity_date_mt} {activity_time_mt}. Trying until {loop_attempt_window_end_mt_str}. <<< ")
+                    
+                    retry_count_in_window = 0
+                    registration_succeeded_this_event = False
+                    final_reg_message = "Registration attempts concluded for the window." # Default message
+                    event_processed_this_cycle = False # Will be True if success, fatal, or window ends unsuccessfully
+
+                    # Define the specific conflict message text - already defined globally, but good to remember it's used here
+                    conflict_message_text = "Sorry, we are unable to complete your reservation. You already have a reservation at this time."
+
+                    while datetime.now(timezone.utc) < current_loop_attempt_window_end_utc and not registration_succeeded_this_event:
+                        current_attempt_time_for_loop_utc = datetime.now(timezone.utc)
+                        # Double check if window closed while in previous logic or short sleep
+                        if current_attempt_time_for_loop_utc >= current_loop_attempt_window_end_utc:
+                            logging.info(f"Attempt window for {class_name} ({event_id}) closed during retry logic ({window_type_log_msg} window).")
+                            break
+
+                        logging.info(f"Attempt {retry_count_in_window + 1} (in {window_type_log_msg} window) for {class_name} ({event_id}) at {current_attempt_time_for_loop_utc.astimezone(MOUNTAIN_TZ).strftime('%I:%M:%S %p %Z')}")
                         
-                        retry_count = 0
-                        registration_succeeded_this_event = False
-                        final_reg_message = "Registration not fully attempted."
-                        event_processed_this_cycle = False # Flag to control adding to processed_event_ids
+                        reg_success, reg_message, reg_data = registration_handler.attempt_event_registration(
+                            event_id, 
+                            MEMBER_IDS_TO_REGISTER, 
+                            jwe_token, 
+                            ssoid_token,
+                            lifetime_registration # Pass the actual module
+                        )
+                        final_reg_message = reg_message # Store last message
 
-                        # Define the specific conflict message text
-                        conflict_message_text = "Sorry, we are unable to complete your reservation. You already have a reservation at this time."
-
-                        while retry_count < MAX_REGISTRATION_RETRIES and not registration_succeeded_this_event:
-                            logging.info(f"Attempt {retry_count + 1}/{MAX_REGISTRATION_RETRIES} for {class_name} ({event_id})")
+                        if reg_success:
+                            registration_succeeded_this_event = True
+                            event_processed_this_cycle = True
+                            logging.info(f"SUCCESS: Registered for {class_name} ({event_id}). Msg: {reg_message}")
                             
-                            reg_success, reg_message, reg_data = registration_handler.attempt_event_registration(
+                            # Call helper to add/save detailed record
+                            _add_event_to_processed_records(
                                 event_id, 
-                                MEMBER_IDS_TO_REGISTER, 
-                                jwe_token, 
-                                ssoid_token,
-                                lifetime_registration # Pass the actual module
+                                class_name, 
+                                activity, # Pass the activity dictionary
+                                "SUCCESS", 
+                                reg_message
                             )
-                            final_reg_message = reg_message # Store last message
-
-                            if reg_success:
-                                registration_succeeded_this_event = True
-                                event_processed_this_cycle = True
-                                logging.info(f"SUCCESS: Registered for {class_name} ({event_id}). Msg: {reg_message}")
-                                subject = f"Registered for {class_name}"
-                                body = f"Successfully registered for: {class_name}\nDate: {activity.get('date')} {activity.get('start_time')}\nLoc: {activity.get('location')}\nConfirm: {reg_message}"
-                                
-                                if notification_sender.send_sms_notification(
-                                    message_body=body,
-                                    subject=subject,
-                                    recipient_sms_email=SMS_RECIPIENT_EMAIL,
-                                    sender_email=EMAIL_SENDER,
-                                    sender_password=EMAIL_PASSWORD,
-                                    smtp_server=SMTP_SERVER,
-                                    smtp_port=SMTP_PORT
-                                ):
-                                    logging.info(f"Success notification sent for {class_name}.")
-                                else:
-                                    logging.warning(f"Failed to send success notification for {class_name}.")
-                                
-                                # --- Discord Notification for Success ---
-                                if DISCORD_WEBHOOK_URL:
-                                    embed_payload_success = {
-                                        "title": f"✅ Successfully Registered: {class_name}",
-                                        "description": f"**Class:** {class_name}\n**Date:** {activity.get('date')} {activity.get('start_time')}\n**Location:** {activity.get('location', 'N/A')}\n**Message:** {reg_message}",
-                                        "color": 0x2ECC71, # Green
-                                        "timestamp": datetime.now(timezone.utc).isoformat()
-                                    }
-                                    if discord_notifier.send_discord_notification(embeds=[embed_payload_success], webhook_url=DISCORD_WEBHOOK_URL):
-                                        logging.info(f"Sent Discord success notification for {class_name}.")
-                                    else:
-                                        logging.warning(f"Failed to send Discord success notification for {class_name}.")
-                                # --- End Discord Notification ---
-                                break # Break from retry loop on success
-                            else: # Registration attempt failed
-                                is_fatal_from_api = False
-                                is_too_soon_from_api = False
-                                notification_msg_from_api = reg_message # Default to message from handler
-
-                                # Check for detailed Step 1 failure info in reg_data
-                                if isinstance(reg_data, dict) and "response" in reg_data: 
-                                    validation_info = reg_data.get("response", {}).get("validation", {})
-                                    if validation_info:
-                                        notification_msg_from_api = validation_info.get('notification', reg_message)
-                                        final_reg_message = notification_msg_from_api # Update with more specific API message if available
-
-                                        is_reservation_conflict = conflict_message_text in notification_msg_from_api
-
-                                        # Check if the error is fatal OR if it's the specific reservation conflict
-                                        if validation_info.get("isFatal", False) or is_reservation_conflict:
-                                            is_fatal_from_api = True # Mark as fatal
-                                            
-                                            if is_reservation_conflict:
-                                                logging.info(f"Identified reservation conflict for {class_name} ({event_id}): '{notification_msg_from_api}'. Treating as fatal.")
-                                            
-                                            # Only check for 'tooSoonRule' if it's a generic fatal error from API AND NOT the specific conflict
-                                            if not is_reservation_conflict and validation_info.get("isFatal", False):
-                                                rules = validation_info.get("rules", {})
-                                                if rules.get("tooSoonRule", {}).get("errorCode") == 40:
-                                                    is_too_soon_from_api = True
-                                                    # The logging for 'tooSoon' will happen in the dedicated block below
-                                
-                                if is_too_soon_from_api:
-                                    logging.info(f"API indicates 'Too Soon' for {class_name} ({event_id}): {final_reg_message}. Will not retry in this attempt cycle. Main loop will re-evaluate.")
-                                    event_processed_this_cycle = False # Do not mark as processed, let main loop try again later
-                                    break # Break from retry loop, but DON'T add to processed_event_ids
-                                elif is_fatal_from_api: # Other fatal errors (e.g., already registered, ineligible, or the identified reservation conflict)
-                                    logging.warning(f"Ineligible/Fatal API Error for {class_name} ({event_id}): {final_reg_message}. No more retries.")
-                                    event_processed_this_cycle = True # Mark as processed
-                                    subject = f"NOT Registered (Ineligible/Conflict): {class_name}" # Updated subject
-                                    body = f"Could not register for: {class_name} on {activity.get('date')} {activity.get('start_time')}.\nReason: {final_reg_message}"
-                                    if notification_sender.send_sms_notification(body, subject, SMS_RECIPIENT_EMAIL, EMAIL_SENDER, EMAIL_PASSWORD, SMTP_SERVER, SMTP_PORT):
-                                        logging.info(f"Ineligibility/conflict notification sent for {class_name}.")
-                                    
-                                    # --- Discord Notification for Fatal/Ineligible Error ---
-                                    if DISCORD_WEBHOOK_URL:
-                                        embed_payload_fatal = {
-                                            "title": f"⚠️ Registration Not Processed: {class_name}",
-                                            "description": f"Could not register for **{class_name}** on {activity.get('date')} {activity.get('start_time')}.\n**Reason:** {final_reg_message}",
-                                            "color": 0xF39C12, # Orange
-                                            "timestamp": datetime.now(timezone.utc).isoformat()
-                                        }
-                                        if discord_notifier.send_discord_notification(embeds=[embed_payload_fatal], webhook_url=DISCORD_WEBHOOK_URL):
-                                            logging.info(f"Sent Discord fatal/ineligible notification for {class_name}.")
-                                        else:
-                                            logging.warning(f"Failed to send Discord fatal/ineligible notification for {class_name}.")
-                                    # --- End Discord Notification ---
-                                    break # Break from retry loop
-                                else: # Non-fatal, retryable error
-                                    logging.warning(f"FAILED Attempt {retry_count + 1}/{MAX_REGISTRATION_RETRIES} for {class_name} ({event_id}). Msg: {final_reg_message}")
-                                    retry_count += 1
-                                    if retry_count < MAX_REGISTRATION_RETRIES:
-                                        logging.info(f"Waiting {REGISTRATION_RETRY_DELAY_SECONDS}s before next attempt for {class_name}...")
-                                        time.sleep(REGISTRATION_RETRY_DELAY_SECONDS)
-                        # End of retry while loop
-                        
-                        if not registration_succeeded_this_event and event_processed_this_cycle: # Only if it wasn't 'too_soon' and retries exhausted for other reasons
-                            logging.error(f"Registration FAILED for {class_name} ({event_id}) after {retry_count if retry_count > 0 else MAX_REGISTRATION_RETRIES} attempts. Final msg: {final_reg_message}")
-                            subject = f"FAILED to Register: {class_name}"
-                            body = f"Failed to register for: {class_name} on {activity.get('date')} {activity.get('start_time')} after attempts.\nLast error: {final_reg_message}"
-                            if notification_sender.send_sms_notification(body, subject, SMS_RECIPIENT_EMAIL, EMAIL_SENDER, EMAIL_PASSWORD, SMTP_SERVER, SMTP_PORT):
-                                logging.info(f"Final failure notification sent for {class_name}.")
                             
-                            # --- Discord Notification for Failure after Retries ---
+                            # --- Discord Notification for Success ---
                             if DISCORD_WEBHOOK_URL:
-                                embed_payload_failure = {
-                                    "title": f"❌ Registration Failed: {class_name}",
-                                    "description": f"Failed to register for **{class_name}** on {activity.get('date')} {activity.get('start_time')} after {retry_count if retry_count > 0 else MAX_REGISTRATION_RETRIES} attempts.\n**Last Error:** {final_reg_message}",
-                                    "color": 0xE74C3C, # Red
-                                    "timestamp": datetime.now(timezone.utc).isoformat()
+                                embed_payload_success = {
+                                    "title": f"✅ Successfully Registered: {class_name}",
+                                    "description": f"**Class:** {class_name}\n**Event ID:** {event_id}\n**Date:** {activity.get('date')} {activity.get('start_time')}\n**Location:** {activity.get('location', 'N/A')}\n**Message:** {reg_message}",
+                                    "color": 0x2ECC71, # Green
+                                    "timestamp": datetime.now(timezone.utc).astimezone(MOUNTAIN_TZ).isoformat()
                                 }
-                                if discord_notifier.send_discord_notification(embeds=[embed_payload_failure], webhook_url=DISCORD_WEBHOOK_URL):
-                                    logging.info(f"Sent Discord failure after retries notification for {class_name}.")
-                                else:
-                                    logging.warning(f"Failed to send Discord failure after retries notification for {class_name}.")
+                                if discord_notifier.send_discord_notification(embeds=[embed_payload_success], webhook_url=DISCORD_WEBHOOK_URL):
+                                    logging.info(f"Sent Discord success notification for {class_name}.")
+                                else: # Corrected indentation from original code for this else
+                                    logging.warning(f"Failed to send Discord success notification for {class_name}.")
                             # --- End Discord Notification ---
-                        
-                        if event_processed_this_cycle:
-                            processed_event_ids.add(event_id)
-                            save_processed_events() # Save state immediately after this event is handled
+                            break # Break from retry loop on success
+                        else: # Registration attempt failed
+                            is_fatal_from_api = False 
+                            is_too_soon_from_api = False 
+                            notification_msg_from_api = reg_message 
 
-                        # ---- MODIFICATION FOR RUN_ONCE_FOR_TESTING ----
-                        if RUN_ONCE_FOR_TESTING:
-                            logging.info(f"RUN_ONCE_FOR_TESTING: Registration attempt cycle for class '{class_name}' ({event_id}) completed. Halting further class checks in this run.")
-                            # The outer loop's RUN_ONCE_FOR_TESTING check will handle exiting the script.
-                            break # Break from this for loop (iterating through activities)
-                        # ---------------------------------------------
-                    else:
-                        logging.debug(f"  Registration window not yet open for {class_name} ({event_id}). Opens: {registration_opens_datetime_utc.strftime('%Y-%m-%d %H:%M')}")
+                            if isinstance(reg_data, dict) and "validation" in reg_data: 
+                                validation_info = reg_data.get("validation", {}) 
+                                if validation_info:
+                                    notification_msg_from_api = validation_info.get('notification', reg_message)
+                                    final_reg_message = notification_msg_from_api 
+                                    
+                                    if "Registration will be open on" in notification_msg_from_api:
+                                        is_too_soon_from_api = True
+                                        logging.info(f"API indicates 'Too Soon' (specific message) for {class_name} ({event_id}): \"{notification_msg_from_api}\"")
+                                        # Log event/reg/current times for context
+                                        logging.info(f"  Event Start (MT):              {event_start_datetime_utc.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')}")
+                                        logging.info(f"  Official Reg. Window Opens (MT): {registration_opens_datetime_utc.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')}")
+                                        logging.info(f"  Current Attempt Time (MT):       {current_attempt_time_for_loop_utc.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')}")
+                                    
+                                    else: 
+                                        is_reservation_conflict = conflict_message_text in notification_msg_from_api
+                                        if validation_info.get("isFatal", False) or is_reservation_conflict:
+                                            if is_reservation_conflict:
+                                                is_fatal_from_api = True 
+                                                logging.info(f"Identified reservation conflict for {class_name} ({event_id}): '{notification_msg_from_api}'. Treating as fatal.")
+                                            elif validation_info.get("isFatal", False): 
+                                                rules = validation_info.get("rules", {})
+                                                if rules.get("tooSoonRule", {}).get("errorCode") == 40: # Old tooSoonRule
+                                                    is_too_soon_from_api = True # Reclassify as "too soon" for our logic
+                                                    logging.info(f"API indicates 'Too Soon' (errorCode 40) for {class_name} ({event_id}). Message: \"{notification_msg_from_api}\"")
+                                                else:
+                                                    is_fatal_from_api = True # Truly fatal
+                                        # If not a conflict and API doesn't say isFatal, it might be a retryable error. is_fatal/is_too_soon remain False.
+                                else: 
+                                    logging.warning(f"Could not parse detailed validation info from reg_data (empty validation_info dict) for {class_name} ({event_id}). reg_data: {reg_data}")
+                            else: 
+                                logging.warning(f"Could not parse detailed validation info from reg_data (bad structure or key missing) for {class_name} ({event_id}). reg_data: {reg_data}")
+                            
+                            # --- Decision point based on flags ---
+                            if is_too_soon_from_api:
+                                logging.info(f"API indicates 'Too Soon' for {class_name} ({event_id}) during active {window_type_log_msg} window. Overall Message: \"{final_reg_message}\". Pausing attempts for this event in current cycle. Main loop will re-evaluate.")
+                                event_processed_this_cycle = False # Do not mark as processed for THIS reason, let main loop try again
+                                break # Break from THIS retry loop for THIS event.
+                            elif is_fatal_from_api: 
+                                logging.warning(f"Ineligible/Fatal API Error for {class_name} ({event_id}) during {window_type_log_msg} window: {final_reg_message}. No more retries for this event.")
+                                event_processed_this_cycle = True # Mark for adding to processed records
+                                
+                                status_str = "FATAL_API_ERROR"
+                                if "You are already registered" in final_reg_message:
+                                    status_str = "FATAL_ALREADY_REGISTERED"
+                                elif conflict_message_text in final_reg_message: # Check if it was a reservation conflict
+                                    status_str = "FATAL_RESERVATION_CONFLICT"
+                                
+                                _add_event_to_processed_records(
+                                    event_id,
+                                    class_name,
+                                    activity, # Pass the activity dictionary
+                                    status_str,
+                                    final_reg_message
+                                )
+                                
+                                # --- Discord Notification for Fatal/Ineligible Error ---
+                                if DISCORD_WEBHOOK_URL:
+                                    embed_payload_fatal = {
+                                        "title": f"⚠️ Registration Not Processed: {class_name}",
+                                        "description": f"Could not register for **{class_name}** (Event ID: {event_id}) on {activity.get('date')} {activity.get('start_time')}.\n**Reason:** {final_reg_message}",
+                                        "color": 0xF39C12, # Orange
+                                        "timestamp": datetime.now(timezone.utc).astimezone(MOUNTAIN_TZ).isoformat()
+                                    }
+                                    if discord_notifier.send_discord_notification(embeds=[embed_payload_fatal], webhook_url=DISCORD_WEBHOOK_URL):
+                                        logging.info(f"Sent Discord fatal/ineligible notification for {class_name}.")
+                                    else:
+                                        logging.warning(f"Failed to send Discord fatal/ineligible notification for {class_name}.")
+                                # --- End Discord Notification ---
+                                break # Break from retry loop
+                            else: # Non-fatal, retryable error within the window
+                                retry_count_in_window += 1
+                                logging.warning(f"FAILED Attempt {retry_count_in_window} (in {window_type_log_msg} window) for {class_name} ({event_id}). Msg: {final_reg_message}")
+                                # Check if there's time for another attempt + sleep interval
+                                if datetime.now(timezone.utc) + timedelta(seconds=REGISTRATION_RETRY_INTERVAL_WITHIN_WINDOW_SECONDS) < current_loop_attempt_window_end_utc:
+                                    logging.info(f"Waiting {REGISTRATION_RETRY_INTERVAL_WITHIN_WINDOW_SECONDS}s before next attempt in {window_type_log_msg} window for {class_name}...")
+                                    time.sleep(REGISTRATION_RETRY_INTERVAL_WITHIN_WINDOW_SECONDS)
+                                else:
+                                    logging.info(f"Not enough time left in {window_type_log_msg} window for another retry for {class_name} ({event_id}). Concluding attempts for this window.")
+                                    break # Break if not enough time for sleep and another go
+                    # End of retry while loop (window ended, or broke due to success/fatal)
+                    
+                    # After the while loop, determine final status if not already set by success/fatal
+                    if not registration_succeeded_this_event and not event_processed_this_cycle:
+                        # This means the window ended, no success, and not a pre-emptive fatal/too_soon that already recorded it.
+                        logging.error(f"Registration FAILED for {class_name} ({event_id}) after trying during the active {window_type_log_msg} window (up to {active_window_duration_for_message}s). Final msg: {final_reg_message}")
+                        
+                        _add_event_to_processed_records(
+                            event_id,
+                            class_name,
+                            activity, # Pass the activity dictionary
+                            "FAILURE_WINDOW_EXPIRED",
+                            final_reg_message,
+                            attempts_in_window=retry_count_in_window
+                        )
+                        
+                        # --- Discord Notification for Failure after Window ---
+                        if DISCORD_WEBHOOK_URL:
+                            embed_payload_failure = {
+                                "title": f"❌ Registration Failed (Window Expired): {class_name}",
+                                "description": f"Failed to register for **{class_name}** (Event ID: {event_id}) on {activity.get('date')} {activity.get('start_time')} after trying during its {active_window_duration_for_message}s attempt window ({window_type_log_msg} type).\n**Attempts Made in Window:** {retry_count_in_window}\n**Last Error:** {final_reg_message}",
+                                "color": 0xE74C3C, # Red
+                                "timestamp": datetime.now(timezone.utc).astimezone(MOUNTAIN_TZ).isoformat()
+                            }
+                            if discord_notifier.send_discord_notification(embeds=[embed_payload_failure], webhook_url=DISCORD_WEBHOOK_URL):
+                                logging.info(f"Sent Discord failure (window expired) notification for {class_name}.")
+                            else:
+                                logging.warning(f"Failed to send Discord failure (window expired) notification for {class_name}.")
+                        # --- End Discord Notification ---
+                        event_processed_this_cycle = True # Marked as processed because window expired
+
+                    if event_processed_this_cycle:
+                        # The actual adding to records and saving is now handled by _add_event_to_processed_records
+                        # So, processed_event_ids.add(event_id) and save_processed_events() are no longer directly called here.
+                        # Ensure _add_event_to_processed_records was called if event_processed_this_cycle is true.
+                        # The logic above should cover: success, fatal, or window expired failure.
+                        pass # Actions are now within the specific outcome blocks
+
+                    # ---- MODIFICATION FOR RUN_ONCE_FOR_TESTING ----
+                    if RUN_ONCE_FOR_TESTING:
+                        logging.info(f"RUN_ONCE_FOR_TESTING: Registration attempt cycle for class '{class_name}' ({event_id}) completed. Halting further class checks in this run.")
+                        break # Break from this for loop (iterating through activities)
+                    # ---------------------------------------------
+                # This else was for: if now_utc_datetime >= registration_opens_datetime_utc:
+                # It's no longer needed due to the new window logic handling all cases (before window, in window, after window)
+                # else:
+                #     reg_opens_dt_mt_str = registration_opens_datetime_utc.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+                #     logging.debug(f"  Registration window not yet open for {class_name} ({event_id}). Opens: {reg_opens_dt_mt_str}")
 
             # --- Check for RUN_ONCE_FOR_TESTING exit condition ---
             if RUN_ONCE_FOR_TESTING:
@@ -449,9 +729,83 @@ def main():
                     logging.info("RUN_ONCE_FOR_TESTING: Processing cycle complete. Exiting.")
                     break # Exit the main while True loop
 
-            logging.debug(f"Loop finished. Sleeping for {REGISTRATION_ATTEMPT_CHECK_INTERVAL_SECONDS}s...")
-            save_processed_events()
-            time.sleep(REGISTRATION_ATTEMPT_CHECK_INTERVAL_SECONDS)
+            # --- Dynamic Sleep Logic (replaces the old simple time.sleep) ---
+            save_processed_events() # Save state before potentially long sleep
+
+            now_for_sleep_calc = datetime.now(timezone.utc)
+            next_event_description = "No specific upcoming events identified."
+            target_next_event_time_utc = None
+            sleep_seconds_to_perform = DEFAULT_MAX_SLEEP_INTERVAL_S # Default to max sleep
+
+            # 1. Determine the time of the soonest pending registration window
+            next_pending_attempt_window_start_utc = None
+            if current_schedule_activities:
+                for activity_detail_sleep in current_schedule_activities: # Renamed to avoid conflict
+                    event_id_sleep = activity_detail_sleep.get("id")
+                    if event_id_sleep in processed_event_id_set: # Use renamed set
+                        continue
+                    try:
+                        start_ts_ms_sleep = int(activity_detail_sleep.get("start_timestamp"))
+                        event_start_dt_sleep = datetime.fromtimestamp(start_ts_ms_sleep / 1000, timezone.utc)
+                        reg_opens_dt_sleep = event_start_dt_sleep - timedelta(minutes=REGISTRATION_OPEN_MINUTES_BEFORE_EVENT)
+                        
+                        # Calculate start of our defined attempt window
+                        attempt_win_start_dt_sleep = reg_opens_dt_sleep - timedelta(seconds=REGISTRATION_ATTEMPT_LEAD_TIME_SECONDS)
+
+                        if attempt_win_start_dt_sleep > now_for_sleep_calc: # Only consider future times
+                            if next_pending_attempt_window_start_utc is None or attempt_win_start_dt_sleep < next_pending_attempt_window_start_utc:
+                                next_pending_attempt_window_start_utc = attempt_win_start_dt_sleep
+                    except (ValueError, TypeError): # Added TypeError
+                        pass # Error would have been logged when this activity was first evaluated in the loop
+
+            if next_pending_attempt_window_start_utc:
+                target_next_event_time_utc = next_pending_attempt_window_start_utc
+                next_attempt_win_start_mt_str = next_pending_attempt_window_start_utc.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+                # Calculate and format time until this next registration attempt window starts
+                time_delta_to_next_attempt_win = next_pending_attempt_window_start_utc - now_for_sleep_calc
+                time_until_next_attempt_win_hr = format_timedelta_to_human_readable(time_delta_to_next_attempt_win)
+                next_event_description = f"next registration attempt window opens at {next_attempt_win_start_mt_str} (in {time_until_next_attempt_win_hr})"
+
+            # 2. Determine the time for the next schedule fetch
+            # Ensure last_schedule_fetch_time is not 0 before adding SCHEDULE_CHECK_INTERVAL_SECONDS if we want to avoid immediate re-fetch after initial failure.
+            # However, if it's 0, next_schedule_fetch_due_utc calculation is fine, it just means it's due "now" or in the past.
+            next_schedule_fetch_due_utc = datetime.fromtimestamp(last_schedule_fetch_time + SCHEDULE_CHECK_INTERVAL_SECONDS, timezone.utc)
+
+            if next_schedule_fetch_due_utc > now_for_sleep_calc:
+                if target_next_event_time_utc is None or next_schedule_fetch_due_utc < target_next_event_time_utc:
+                    target_next_event_time_utc = next_schedule_fetch_due_utc
+                    next_fetch_due_mt_str = next_schedule_fetch_due_utc.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+                    next_event_description = f"next schedule fetch due at {next_fetch_due_mt_str}"
+            # If next_schedule_fetch_due_utc <= now_for_sleep_calc, it means it's time (or past time) to fetch.
+            # The main fetch logic at the top of the loop will handle it. A short sleep is appropriate if no closer registration event.
+
+            # 3. Calculate sleep duration based on the identified target_next_event_time_utc
+            if target_next_event_time_utc: # If there is a specific future event (registration or schedule fetch)
+                delta_seconds = (target_next_event_time_utc - now_for_sleep_calc).total_seconds()
+                # Sleep at least MIN_SLEEP_INTERVAL_S, at most DEFAULT_MAX_SLEEP_INTERVAL_S, or until the event
+                sleep_seconds_to_perform = max(MIN_SLEEP_INTERVAL_S, min(delta_seconds, DEFAULT_MAX_SLEEP_INTERVAL_S))
+            else:
+                # No specific *future* target event identified. This means:
+                # - All registrations are in the past or processed.
+                # - AND Next schedule fetch is also in the past (or it's the very first run and last_schedule_fetch_time is 0).
+                if last_schedule_fetch_time == 0 and not schedule_fetched_this_iteration:
+                    # Initial login/fetch failed or yielded nothing, and it's the first attempt cycle for fetching.
+                    sleep_seconds_to_perform = INITIAL_FETCH_RETRY_INTERVAL_S
+                    next_event_description = f"initial login/schedule fetch was not successful. Retrying tasks in {INITIAL_FETCH_RETRY_INTERVAL_S}s"
+                else:
+                    # All pending events (regs/fetch) are in the past or current moment.
+                    # The loop will immediately re-evaluate them. So, just MIN_SLEEP_INTERVAL_S.
+                    sleep_seconds_to_perform = MIN_SLEEP_INTERVAL_S
+                    if not next_event_description or next_event_description == "No specific upcoming events identified.":
+                         if next_schedule_fetch_due_utc <= now_for_sleep_calc:
+                            next_event_description = "next schedule fetch is due now or was due"
+                         else: # Should not happen if target_next_event_time_utc is None
+                            next_event_description = "evaluating immediate tasks"
+           
+            # Final log before sleeping
+            current_time_log_mt_str = now_for_sleep_calc.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+            logging.info(f"Current time: {current_time_log_mt_str}. {next_event_description.capitalize()}. Sleeping for {sleep_seconds_to_perform:.1f} seconds.")
+            time.sleep(sleep_seconds_to_perform)
 
     except KeyboardInterrupt:
         logging.info("Script stopped by user.")

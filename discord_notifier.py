@@ -11,7 +11,7 @@ FALLBACK_DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/136986931647191
 def send_discord_notification(
     content: str = None,
     embeds: list = None, # List of embed objects
-    webhook_url: str = None
+    webhook_url: str = None # Explicitly passed URL takes highest precedence
 ) -> bool:
     """
     Sends a notification message (content and/or embeds) to a Discord webhook.
@@ -20,34 +20,47 @@ def send_discord_notification(
         content: The plain text message content (max 2000 chars).
         embeds: A list of embed objects (dicts) for rich formatting (max 10 embeds).
                 See: https://discord.com/developers/docs/resources/channel#embed-object
-        webhook_url: The Discord webhook URL.
-                     If None, tries os.getenv("DISCORD_WEBHOOK_URL"), then FALLBACK_DISCORD_WEBHOOK_URL.
+        webhook_url: The Discord webhook URL. If provided, this URL is used.
+                     If None, tries os.getenv("DISCORD_WEBHOOK_URL").
+                     If that's also None, uses FALLBACK_DISCORD_WEBHOOK_URL.
 
     Returns:
         True if the message was sent successfully, False otherwise.
     """
-    target_url = webhook_url or os.getenv("DISCORD_WEBHOOK_URL") or FALLBACK_DISCORD_WEBHOOK_URL
+    # Determine the target URL with clear precedence
+    env_webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    
+    if webhook_url: # Parameter has highest precedence
+        target_url = webhook_url
+        url_source = "parameter"
+    elif env_webhook_url: # Environment variable is next
+        target_url = env_webhook_url
+        url_source = "environment variable (DISCORD_WEBHOOK_URL)"
+    else: # Fallback is last resort
+        target_url = FALLBACK_DISCORD_WEBHOOK_URL
+        url_source = "fallback URL in discord_notifier.py"
+
+    logging.info(f"Discord Notifier: Determined target_url: '{target_url if target_url else 'None'}' (Source: {url_source})")
 
     if not target_url:
-        logging.error("Discord webhook URL is not configured and no fallback is available.")
+        logging.error("Discord Notifier: Webhook URL is not configured (checked parameter, env var, and fallback). Cannot send.")
         return False
 
     if not content and not embeds:
-        logging.warning("Attempted to send Discord notification with no content or embeds. This might be rejected by Discord.")
+        logging.warning("Discord Notifier: Attempting to send notification with no content or embeds.")
         # Discord might require at least one. Let's allow the attempt.
-        # return False 
 
     payload = {}
     if content:
-        payload["content"] = content[:2000] # Enforce Discord's limit
+        payload["content"] = content[:2000] 
     if embeds:
-        payload["embeds"] = embeds[:10] # Enforce Discord's limit
-        # Note: Individual embed limits (e.g., description 4096 chars, 25 fields)
-        # are assumed to be handled by the caller.
+        payload["embeds"] = embeds[:10] 
     
+    logging.info(f"Discord Notifier: Attempting to send to {target_url} with payload: {str(payload)[:100]}...") # Log truncated payload for brevity
+
     try:
         response = requests.post(target_url, json=payload)
-        response.raise_for_status()  # Raise an exception for HTTP errors (4xx or 5xx)
+        response.raise_for_status()  
         
         message_type_parts = []
         if content:
@@ -56,12 +69,12 @@ def send_discord_notification(
             message_type_parts.append(f"{len(embeds)} embed(s)")
         message_type_str = " and ".join(message_type_parts) if message_type_parts else "empty message"
 
-        logging.info(f"Successfully sent Discord notification ({message_type_str}).")
+        logging.info(f"Discord Notifier: Successfully sent notification ({message_type_str}) to {target_url}.")
         return True
     except requests.exceptions.RequestException as e:
-        logging.error(f"Error sending Discord notification: {e}")
+        logging.error(f"Discord Notifier: Error sending notification to {target_url}: {e}")
         if hasattr(e, 'response') and e.response is not None:
-            logging.error(f"Discord API response: Status {e.response.status_code} - {e.response.text}")
+            logging.error(f"Discord Notifier: API response: Status {e.response.status_code} - {e.response.text}")
         return False
 
 if __name__ == '__main__':

@@ -1,4 +1,7 @@
+certifi==2025.4.26
+charset-normalizer==3.4.2
+idna==3.10
+python-dotenv==1.1.0
+pytz==2025.2
 requests==2.31.0
-python-dotenv
-# Only needed for Windows notifications
-win10toast==0.9; platform_system=="Windows" 
+urllib3==2.4.0

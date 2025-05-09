@@ -1,0 +1,56 @@
+[
+    {
+        "event_id": "ZXhlcnA6MzMyYm9vazMyNDQwNToyMDI1LTA1LTEw",
+        "class_name": "Pickleball Open Play: Intermediate open play for 3.0-3.9. Please meet on indoor courts.",
+        "event_datetime_mt": "2025-05-10 12:00 PM MDT",
+        "registration_opens_mt": "2025-05-02 02:00 PM MDT",
+        "status": "FATAL_ALREADY_REGISTERED",
+        "message": "Sorry, we are unable to complete your reservation. You are already registered.",
+        "processed_timestamp_mt": "2025-05-09 01:06:46 PM MDT"
+    },
+    {
+        "event_id": "ZXhlcnA6MzMyYm9vazM1OTc0NDoyMDI1LTA1LTEw",
+        "class_name": "Pickleball Open Play: Lower intermediate open play. 3.0-3.4",
+        "event_datetime_mt": "2025-05-10 12:00 PM MDT",
+        "registration_opens_mt": "2025-05-02 02:00 PM MDT",
+        "status": "FATAL_RESERVATION_CONFLICT",
+        "message": "Sorry, we are unable to complete your reservation. You already have a reservation at this time.",
+        "processed_timestamp_mt": "2025-05-09 01:06:48 PM MDT"
+    },
+    {
+        "event_id": "ZXhlcnA6MzMyYm9vazM1ODc5NDoyMDI1LTA1LTEx",
+        "class_name": "Pickleball Open Play: Intermediate Open Play 3.0-3.4",
+        "event_datetime_mt": "2025-05-11 09:30 AM MDT",
+        "registration_opens_mt": "2025-05-03 11:30 AM MDT",
+        "status": "FATAL_ALREADY_REGISTERED",
+        "message": "Sorry, we are unable to complete your reservation. You are already registered.",
+        "processed_timestamp_mt": "2025-05-09 01:06:49 PM MDT"
+    },
+    {
+        "event_id": "ZXhlcnA6MzMyYm9vazMyMjg5NzoyMDI1LTA1LTEx",
+        "class_name": "Pickleball Open Play: Intermediate open play for 3.0-3.9.",
+        "event_datetime_mt": "2025-05-11 09:30 AM MDT",
+        "registration_opens_mt": "2025-05-03 11:30 AM MDT",
+        "status": "FATAL_RESERVATION_CONFLICT",
+        "message": "Sorry, we are unable to complete your reservation. You already have a reservation at this time.",
+        "processed_timestamp_mt": "2025-05-09 01:06:51 PM MDT"
+    },
+    {
+        "event_id": "ZXhlcnA6MzMyYm9vazMyMjkyNToyMDI1LTA1LTEy",
+        "class_name": "Pickleball Open Play: Lower Intermediate open play for 3.0-3.4.",
+        "event_datetime_mt": "2025-05-12 05:00 PM MDT",
+        "registration_opens_mt": "2025-05-04 07:00 PM MDT",
+        "status": "FATAL_ALREADY_REGISTERED",
+        "message": "Sorry, we are unable to complete your reservation. You are already registered.",
+        "processed_timestamp_mt": "2025-05-09 01:06:52 PM MDT"
+    },
+    {
+        "event_id": "ZXhlcnA6MzMyYm9vazM1NTg2NzoyMDI1LTA1LTE1",
+        "class_name": "Pickleball Open Play: Lower intermediate open play (3.0-3.4 DUPR). You do not need a DUPR for this open play just need to be lower intermediate.",
+        "event_datetime_mt": "2025-05-15 05:30 PM MDT",
+        "registration_opens_mt": "2025-05-07 07:30 PM MDT",
+        "status": "FATAL_ALREADY_REGISTERED",
+        "message": "Sorry, we are unable to complete your reservation. You are already registered.",
+        "processed_timestamp_mt": "2025-05-09 01:06:54 PM MDT"
+    }
+]
