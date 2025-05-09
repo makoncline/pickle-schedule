@@ -103,8 +103,8 @@ REGISTRATION_OPEN_MINUTES_BEFORE_EVENT = 11400  # As per user spec
 SCHEDULE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60    # 24 hours
 # REGISTRATION_ATTEMPT_CHECK_INTERVAL_SECONDS = 1 # Replaced by dynamic sleep
 # --- New Windowed Registration Attempt Config ---
-REGISTRATION_ATTEMPT_LEAD_TIME_SECONDS = 5  # How many seconds before official open time to start first attempt
-REGISTRATION_ATTEMPT_DURATION_SECONDS = 30 # Total duration for active registration attempts
+REGISTRATION_ATTEMPT_LEAD_TIME_SECONDS = 2  # How many seconds before official open time to start first attempt
+REGISTRATION_ATTEMPT_DURATION_SECONDS = 120 # Total duration for active registration attempts
 REGISTRATION_RETRY_INTERVAL_WITHIN_WINDOW_SECONDS = 2 # Interval between attempts within the active window
 CATCH_UP_ATTEMPT_DURATION_SECONDS = 10 # Duration to attempt if ideal window already passed for a new event
 
@@ -627,9 +627,10 @@ def main():
                             
                             # --- Decision point based on flags ---
                             if is_too_soon_from_api:
-                                logging.info(f"API indicates 'Too Soon' for {class_name} ({event_id}) during active {window_type_log_msg} window. Overall Message: \"{final_reg_message}\". Pausing attempts for this event in current cycle. Main loop will re-evaluate.")
-                                event_processed_this_cycle = False # Do not mark as processed for THIS reason, let main loop try again
-                                break # Break from THIS retry loop for THIS event.
+                                logging.info(f"API indicates 'Too Soon' for {class_name} ({event_id}) on attempt {retry_count_in_window + 1} in {window_type_log_msg} window. Message: \"{final_reg_message}\". Continuing attempts if window open.")
+                                # Don't break the main attempt loop here. Let it continue trying if window is open.
+                                # event_processed_this_cycle remains False for now.
+                                # Increment retry_count, sleep, and continue to next attempt is handled by the main loop structure below if not fatal.
                             elif is_fatal_from_api: 
                                 logging.warning(f"Ineligible/Fatal API Error for {class_name} ({event_id}) during {window_type_log_msg} window: {final_reg_message}. No more retries for this event.")
                                 event_processed_this_cycle = True # Mark for adding to processed records
@@ -662,7 +663,7 @@ def main():
                                         logging.warning(f"Failed to send Discord fatal/ineligible notification for {class_name}.")
                                 # --- End Discord Notification ---
                                 break # Break from retry loop
-                            else: # Non-fatal, retryable error within the window
+                            else: # Non-fatal, retryable error within the window (or a "too soon" that we are now letting continue)
                                 retry_count_in_window += 1
                                 logging.warning(f"FAILED Attempt {retry_count_in_window} (in {window_type_log_msg} window) for {class_name} ({event_id}). Msg: {final_reg_message}")
                                 # Check if there's time for another attempt + sleep interval
@@ -677,38 +678,58 @@ def main():
                     # After the while loop, determine final status if not already set by success/fatal
                     if not registration_succeeded_this_event and not event_processed_this_cycle:
                         # This means the window ended, no success, and not a pre-emptive fatal/too_soon that already recorded it.
-                        logging.error(f"Registration FAILED for {class_name} ({event_id}) after trying during the active {window_type_log_msg} window (up to {active_window_duration_for_message}s). Final msg: {final_reg_message}")
                         
-                        _add_event_to_processed_records(
-                            event_id,
-                            class_name,
-                            activity, # Pass the activity dictionary
-                            "FAILURE_WINDOW_EXPIRED",
-                            final_reg_message,
-                            attempts_in_window=retry_count_in_window
-                        )
-                        
-                        # --- Discord Notification for Failure after Window ---
-                        if DISCORD_WEBHOOK_URL:
-                            embed_payload_failure = {
-                                "title": f"❌ Registration Failed (Window Expired): {class_name}",
-                                "description": f"Failed to register for **{class_name}** (Event ID: {event_id}) on {activity.get('date')} {activity.get('start_time')} after trying during its {active_window_duration_for_message}s attempt window ({window_type_log_msg} type).\n**Attempts Made in Window:** {retry_count_in_window}\n**Last Error:** {final_reg_message}",
-                                "color": 0xE74C3C, # Red
-                                "timestamp": datetime.now(timezone.utc).astimezone(MOUNTAIN_TZ).isoformat()
-                            }
-                            if discord_notifier.send_discord_notification(embeds=[embed_payload_failure], webhook_url=DISCORD_WEBHOOK_URL):
-                                logging.info(f"Sent Discord failure (window expired) notification for {class_name}.")
-                            else:
-                                logging.warning(f"Failed to send Discord failure (window expired) notification for {class_name}.")
-                        # --- End Discord Notification ---
-                        event_processed_this_cycle = True # Marked as processed because window expired
+                        # Check the final_reg_message to see if the API still reported "too soon" as the last reason.
+                        if "Registration will be open on" in final_reg_message:
+                            logging.info(f"Attempt window ({window_type_log_msg}) for {class_name} ({event_id}) expired. API still reports 'Too Soon'. Message: \"{final_reg_message}\". Will re-evaluate in next cycle.")
+                            # DO NOT mark as processed. Let it be re-evaluated in the next main loop iteration.
+                            event_processed_this_cycle = False # Explicitly false
+                            # Send a specific Discord notification for this scenario
+                            if DISCORD_WEBHOOK_URL:
+                                embed_payload_still_too_soon = {
+                                    "title": f"🟡 Registration Window Expired - API Still Too Soon: {class_name}",
+                                    "description": f"The {active_window_duration_for_message}s attempt window ({window_type_log_msg} type) for **{class_name}** (Event ID: {event_id}) has expired.\n**Attempts Made in Window:** {retry_count_in_window}\n**Final API Message:** {final_reg_message}\n\nThe script will re-evaluate this event in the next cycle.",
+                                    "color": 0xFFA500, # Orange/Amber
+                                    "timestamp": datetime.now(timezone.utc).astimezone(MOUNTAIN_TZ).isoformat()
+                                }
+                                if discord_notifier.send_discord_notification(embeds=[embed_payload_still_too_soon], webhook_url=DISCORD_WEBHOOK_URL):
+                                    logging.info(f"Sent Discord 'API Still Too Soon After Window' notification for {class_name}.")
+                                else:
+                                    logging.warning(f"Failed to send Discord 'API Still Too Soon After Window' notification for {class_name}.")
+                        else:
+                            # The window expired, and the last error was not an explicit "Registration will be open on..."
+                            logging.error(f"Registration FAILED for {class_name} ({event_id}) after trying during the active {window_type_log_msg} window (up to {active_window_duration_for_message}s). Final msg: {final_reg_message}")
+                            _add_event_to_processed_records(
+                                event_id,
+                                class_name,
+                                activity, # Pass the activity dictionary
+                                "FAILURE_WINDOW_EXPIRED",
+                                final_reg_message,
+                                attempts_in_window=retry_count_in_window
+                            )
+                            event_processed_this_cycle = True # Mark as processed because window expired with other errors
 
+                            # --- Discord Notification for Failure after Window ---
+                            if DISCORD_WEBHOOK_URL:
+                                embed_payload_failure = {
+                                    "title": f"❌ Registration Failed (Window Expired): {class_name}",
+                                    "description": f"Failed to register for **{class_name}** (Event ID: {event_id}) on {activity.get('date')} {activity.get('start_time')} after trying during its {active_window_duration_for_message}s attempt window ({window_type_log_msg} type).\n**Attempts Made in Window:** {retry_count_in_window}\n**Last Error:** {final_reg_message}",
+                                    "color": 0xE74C3C, # Red
+                                    "timestamp": datetime.now(timezone.utc).astimezone(MOUNTAIN_TZ).isoformat()
+                                }
+                                if discord_notifier.send_discord_notification(embeds=[embed_payload_failure], webhook_url=DISCORD_WEBHOOK_URL):
+                                    logging.info(f"Sent Discord failure (window expired) notification for {class_name}.")
+                                else:
+                                    logging.warning(f"Failed to send Discord failure (window expired) notification for {class_name}.")
+                            # --- End Discord Notification ---
+                        
                     if event_processed_this_cycle:
-                        # The actual adding to records and saving is now handled by _add_event_to_processed_records
-                        # So, processed_event_ids.add(event_id) and save_processed_events() are no longer directly called here.
-                        # Ensure _add_event_to_processed_records was called if event_processed_this_cycle is true.
-                        # The logic above should cover: success, fatal, or window expired failure.
-                        pass # Actions are now within the specific outcome blocks
+                        # For SUCCESS or FATAL_API_ERROR or FAILURE_WINDOW_EXPIRED (non-too-soon)
+                        # _add_event_to_processed_records is called within their respective blocks.
+                        pass 
+                    # If event_processed_this_cycle is False here, it means it was an API "too soon" situation
+                    # throughout the window, and it should be re-attempted in the next main loop cycle.
+                    # No record is saved to processed_event_ids.json for this case yet.
 
                     # ---- MODIFICATION FOR RUN_ONCE_FOR_TESTING ----
                     if RUN_ONCE_FOR_TESTING:
