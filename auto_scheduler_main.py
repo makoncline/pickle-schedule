@@ -60,7 +60,7 @@ class MountainTimeFormatter(logging.Formatter):
 # --- Configure Logging --- 
 # Place this near the top, after imports and MOUNTAIN_TZ definition
 log_formatter = MountainTimeFormatter(
-    fmt='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
+    fmt='%(asctime)s [%(levelname).1s]\n    %(message)s', # Log message on a new, indented line
     datefmt='%Y-%m-%d %I:%M:%S %p %Z' # Changed to AM/PM
 )
 console_handler = logging.StreamHandler(sys.stdout) # Explicitly target sys.stdout
