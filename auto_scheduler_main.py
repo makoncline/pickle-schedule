@@ -446,10 +446,10 @@ def main():
                             start_ts_ms_str_mon = activity_detail.get("start_timestamp")
                             if start_ts_ms_str_mon:
                                 start_dt_utc_mon = datetime.fromtimestamp(int(start_ts_ms_str_mon) / 1000, timezone.utc)
-                                start_dt_mt_str = start_dt_utc_mon.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+                                start_dt_mt_str = start_dt_utc_mon.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M:%S %p %Z')
                                 
                                 reg_opens_dt_utc_mon = start_dt_utc_mon - timedelta(minutes=REGISTRATION_OPEN_MINUTES_BEFORE_EVENT)
-                                reg_opens_dt_mt_str = reg_opens_dt_utc_mon.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+                                reg_opens_dt_mt_str = reg_opens_dt_utc_mon.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M:%S %p %Z')
                                 
                                 # Calculate time until registration for monitored classes
                                 time_delta_to_reg_mon = reg_opens_dt_utc_mon - now_utc_datetime # now_utc_datetime is from the start of the current main loop iteration
@@ -786,7 +786,7 @@ def main():
 
             if next_pending_attempt_window_start_utc:
                 target_next_event_time_utc = next_pending_attempt_window_start_utc
-                next_attempt_win_start_mt_str = next_pending_attempt_window_start_utc.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M %p %Z')
+                next_attempt_win_start_mt_str = next_pending_attempt_window_start_utc.astimezone(MOUNTAIN_TZ).strftime('%Y-%m-%d %I:%M:%S %p %Z')
                 # Calculate and format time until this next registration attempt window starts
                 time_delta_to_next_attempt_win = next_pending_attempt_window_start_utc - now_for_sleep_calc
                 time_until_next_attempt_win_hr = format_timedelta_to_human_readable(time_delta_to_next_attempt_win)
