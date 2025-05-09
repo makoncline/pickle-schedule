@@ -13,6 +13,7 @@ import schedule_fetcher
 from lifetime_auth import perform_login 
 import registration_handler
 import notification_sender
+import discord_notifier # Added for Discord notifications
 
 # It's good practice to also import the lifetime_registration module here if it's needed by registration_handler
 # and not handled internally by it. Based on registration_handler.py, it expects the module to be passed.
@@ -60,6 +61,8 @@ EMAIL_PASSWORD = os.getenv("EMAIL_SENDER_PASSWORD")    # Gmail app password
 # Optional: Override SMTP server/port if not using Gmail defaults
 SMTP_SERVER = os.getenv("SMTP_SERVER", notification_sender.DEFAULT_SMTP_SERVER)
 SMTP_PORT = int(os.getenv("SMTP_PORT", notification_sender.DEFAULT_SMTP_PORT))
+# ---- Add DISCORD_WEBHOOK_URL to your .env file for Discord notifications ----
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL") 
 
 # Timing Config
 REGISTRATION_OPEN_MINUTES_BEFORE_EVENT = 11400  # As per user spec
@@ -114,6 +117,10 @@ def main():
     logging.info(f"Reg Attempt Interval (s): {REGISTRATION_ATTEMPT_CHECK_INTERVAL_SECONDS}")
     logging.info(f"Max Reg Retries: {MAX_REGISTRATION_RETRIES}")
     logging.info(f"Reg Retry Delay (s): {REGISTRATION_RETRY_DELAY_SECONDS}")
+    if DISCORD_WEBHOOK_URL:
+        logging.info(f"Discord Webhook URL: Configured (will send notifications)")
+    else:
+        logging.info(f"Discord Webhook URL: Not configured (will skip Discord notifications)")
     logging.info("---------------------")
 
     if not MEMBER_IDS_TO_REGISTER or not SMS_RECIPIENT_EMAIL or not EMAIL_SENDER or not EMAIL_PASSWORD:
@@ -160,6 +167,53 @@ def main():
                         for i, act in enumerate(current_schedule_activities[:3]): # Print first 3
                             logging.debug(f"  - {act.get('date')} {act.get('start_time')}: {act.get('class_name')}")
                     last_schedule_fetch_time = now_timestamp # Update time only on successful fetch
+                    
+                    # --- Start Discord Notification Block for Fetched Schedule ---
+                    if DISCORD_WEBHOOK_URL and current_schedule_activities and schedule_fetched_this_iteration:
+                        discord_embed_lines = []
+                        for activity_detail in current_schedule_activities: # Iterate over ALL fetched activities
+                            class_name = activity_detail.get('class_name','N/A')
+                            activity_date_str = activity_detail.get('date', 'N/A') 
+                            start_time_str = activity_detail.get('start_time', 'N/A') 
+                            
+                            reg_opens_display_str = "N/A"
+                            try:
+                                start_ts_ms_str = activity_detail.get("start_timestamp")
+                                if start_ts_ms_str is not None:
+                                    start_dt_utc = datetime.fromtimestamp(int(start_ts_ms_str) / 1000, timezone.utc)
+                                    reg_opens_dt_utc = start_dt_utc - timedelta(minutes=REGISTRATION_OPEN_MINUTES_BEFORE_EVENT)
+                                    # Format: e.g., "Mon Jan 01, 15:30 UTC"
+                                    reg_opens_display_str = reg_opens_dt_utc.strftime('%a %b %d, %H:%M %Z') 
+                                else:
+                                    logging.warning(f"Missing start_timestamp for activity ID {activity_detail.get('id')} when creating Discord msg.")
+                            except (ValueError, TypeError, AttributeError) as e_time:
+                                logging.warning(f"Could not parse/format registration time for Discord msg for activity ID {activity_detail.get('id')}: {e_time}")
+
+                            discord_embed_lines.append(f"- **{class_name}**")
+                            discord_embed_lines.append(f"  - Class Time: {activity_date_str} {start_time_str}")
+                            discord_embed_lines.append(f"  - Reg. Opens: {reg_opens_display_str}")
+
+                        embed_title = f"🗓️ Schedule Update: {len(current_schedule_activities)} Classes Fetched"
+                        description_header = "The latest schedule fetch includes the following classes:\n\n"
+                        
+                        full_description = description_header + "\n".join(discord_embed_lines)
+                        
+                        if len(full_description) > 4000: # Discord embed description limit is 4096
+                            full_description = full_description[:4000] + "\n... (message truncated due to length)"
+
+                        discord_embed_payload = {
+                            "title": embed_title,
+                            "description": full_description,
+                            "color": 0x1ABC9C, # A pleasant green color (decimal)
+                            "timestamp": datetime.now(timezone.utc).isoformat()
+                        }
+                        
+                        if discord_notifier.send_discord_notification(embeds=[discord_embed_payload], webhook_url=DISCORD_WEBHOOK_URL):
+                            logging.info(f"Sent Discord notification for {len(current_schedule_activities)} fetched classes.")
+                        else:
+                            logging.warning(f"Failed to send Discord notification for {len(current_schedule_activities)} fetched classes.")
+                    # --- End Discord Notification Block ---
+
                     logging.info("--- Upcoming Monitored Classes (Registration Times UTC) ---")
                     monitored_count = 0
                     for activity_detail in current_schedule_activities:
