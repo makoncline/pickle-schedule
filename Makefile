@@ -1,10 +1,11 @@
-.PHONY: logs start stop restart status clean help
+.PHONY: logs start stop restart status clean update help
 
 # This Makefile is intended for interacting with the systemd service on the Raspberry Pi.
 
 SERVICE_NAME := lifetime-scheduler.service
 SERVICE_LOG_FILE := /var/log/lifetime-scheduler.log
 SERVICE_ERR_FILE := /var/log/lifetime-scheduler.err
+UPDATE_SCRIPT := ./update_scheduler.sh
 
 logs:
 	@echo "Showing last 100 lines of systemd service log ($(SERVICE_LOG_FILE)) and tailing..."
@@ -37,6 +38,11 @@ clean:
 	@sudo truncate -s 0 $(SERVICE_ERR_FILE) || echo "Warning: Could not truncate $(SERVICE_ERR_FILE). It might not exist or permissions issue."
 	@echo "Service log files have been truncated."
 
+update:
+	@echo "Running the update script: $(UPDATE_SCRIPT)..."
+	@echo "This will pull changes, update dependencies, and restart the service."
+	@bash $(UPDATE_SCRIPT)
+
 help:
 	@echo "Available commands for managing the $(SERVICE_NAME) systemd service:"
 	@echo "  make logs        - View live logs from the service"
@@ -45,6 +51,7 @@ help:
 	@echo "  make restart     - Restart the service"
 	@echo "  make status      - Check the status of the service"
 	@echo "  make clean       - Clear (truncate) the service log files"
+	@echo "  make update      - Run the update script (pulls code, updates deps, restarts service)"
 
 # Default target
 default: help

@@ -6,4 +6,5 @@
 
 __pycache__/
 *.log
+processed_event_ids.json
 schedule_output.json 
