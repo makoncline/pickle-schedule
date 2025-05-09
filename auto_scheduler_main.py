@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import logging # Import logging
 import pytz # Added for timezone conversion
+import sys # Added for explicit stdout targeting
 
 # --- Project Modules ---
 import schedule_fetcher
@@ -62,7 +63,7 @@ log_formatter = MountainTimeFormatter(
     fmt='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
     datefmt='%Y-%m-%d %I:%M:%S %p %Z' # Changed to AM/PM
 )
-console_handler = logging.StreamHandler()
+console_handler = logging.StreamHandler(sys.stdout) # Explicitly target sys.stdout
 console_handler.setFormatter(log_formatter)
 
 logging.basicConfig(
@@ -626,12 +627,7 @@ def main():
                                 logging.warning(f"Could not parse detailed validation info from reg_data (bad structure or key missing) for {class_name} ({event_id}). reg_data: {reg_data}")
                             
                             # --- Decision point based on flags ---
-                            if is_too_soon_from_api:
-                                logging.info(f"API indicates 'Too Soon' for {class_name} ({event_id}) on attempt {retry_count_in_window + 1} in {window_type_log_msg} window. Message: \"{final_reg_message}\". Continuing attempts if window open.")
-                                # Don't break the main attempt loop here. Let it continue trying if window is open.
-                                # event_processed_this_cycle remains False for now.
-                                # Increment retry_count, sleep, and continue to next attempt is handled by the main loop structure below if not fatal.
-                            elif is_fatal_from_api: 
+                            if is_fatal_from_api:
                                 logging.warning(f"Ineligible/Fatal API Error for {class_name} ({event_id}) during {window_type_log_msg} window: {final_reg_message}. No more retries for this event.")
                                 event_processed_this_cycle = True # Mark for adding to processed records
                                 
@@ -662,11 +658,19 @@ def main():
                                     else:
                                         logging.warning(f"Failed to send Discord fatal/ineligible notification for {class_name}.")
                                 # --- End Discord Notification ---
-                                break # Break from retry loop
-                            else: # Non-fatal, retryable error within the window (or a "too soon" that we are now letting continue)
+                                break # Break from retry loop, as it's a terminal state for this event
+                            else:
+                                # Not fatal, so it's either "too soon" or another retryable error.
+                                # Increment attempt counter for any non-fatal failed attempt.
                                 retry_count_in_window += 1
-                                logging.warning(f"FAILED Attempt {retry_count_in_window} (in {window_type_log_msg} window) for {class_name} ({event_id}). Msg: {final_reg_message}")
-                                # Check if there's time for another attempt + sleep interval
+
+                                if is_too_soon_from_api:
+                                    logging.info(f"API indicates 'Too Soon' for {class_name} ({event_id}) on attempt {retry_count_in_window} in {window_type_log_msg} window. Message: \"{final_reg_message}\". Continuing attempts if window open.")
+                                else:
+                                    # Other retryable error
+                                    logging.warning(f"FAILED Attempt {retry_count_in_window} (in {window_type_log_msg} window) for {class_name} ({event_id}). Msg: {final_reg_message}")
+                                
+                                # Common sleep logic for non-fatal attempts before next retry or window expiry check
                                 if datetime.now(timezone.utc) + timedelta(seconds=REGISTRATION_RETRY_INTERVAL_WITHIN_WINDOW_SECONDS) < current_loop_attempt_window_end_utc:
                                     logging.info(f"Waiting {REGISTRATION_RETRY_INTERVAL_WITHIN_WINDOW_SECONDS}s before next attempt in {window_type_log_msg} window for {class_name}...")
                                     time.sleep(REGISTRATION_RETRY_INTERVAL_WITHIN_WINDOW_SECONDS)
@@ -677,10 +681,11 @@ def main():
                     
                     # After the while loop, determine final status if not already set by success/fatal
                     if not registration_succeeded_this_event and not event_processed_this_cycle:
-                        # This means the window ended, no success, and not a pre-emptive fatal/too_soon that already recorded it.
+                        # This means the window ended, no success, and not a fatal error that already recorded it.
                         
+                        logging.debug(f"Post-loop check for {event_id}: final_reg_message='{final_reg_message}' (type: {type(final_reg_message)}), retry_count={retry_count_in_window}")
                         # Check the final_reg_message to see if the API still reported "too soon" as the last reason.
-                        if "Registration will be open on" in final_reg_message:
+                        if final_reg_message and "registration will be open on" in final_reg_message.lower(): # More robust check
                             logging.info(f"Attempt window ({window_type_log_msg}) for {class_name} ({event_id}) expired. API still reports 'Too Soon'. Message: \"{final_reg_message}\". Will re-evaluate in next cycle.")
                             # DO NOT mark as processed. Let it be re-evaluated in the next main loop iteration.
                             event_processed_this_cycle = False # Explicitly false
