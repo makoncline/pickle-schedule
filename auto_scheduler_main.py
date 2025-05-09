@@ -282,6 +282,9 @@ def main():
                         final_reg_message = "Registration not fully attempted."
                         event_processed_this_cycle = False # Flag to control adding to processed_event_ids
 
+                        # Define the specific conflict message text
+                        conflict_message_text = "Sorry, we are unable to complete your reservation. You already have a reservation at this time."
+
                         while retry_count < MAX_REGISTRATION_RETRIES and not registration_succeeded_this_event:
                             logging.info(f"Attempt {retry_count + 1}/{MAX_REGISTRATION_RETRIES} for {class_name} ({event_id})")
                             
@@ -325,23 +328,35 @@ def main():
                                     if validation_info:
                                         notification_msg_from_api = validation_info.get('notification', reg_message)
                                         final_reg_message = notification_msg_from_api # Update with more specific API message if available
-                                        if validation_info.get("isFatal", False):
-                                            is_fatal_from_api = True
-                                            rules = validation_info.get("rules", {})
-                                            if rules.get("tooSoonRule", {}).get("errorCode") == 40:
-                                                is_too_soon_from_api = True
+
+                                        is_reservation_conflict = conflict_message_text in notification_msg_from_api
+
+                                        # Check if the error is fatal OR if it's the specific reservation conflict
+                                        if validation_info.get("isFatal", False) or is_reservation_conflict:
+                                            is_fatal_from_api = True # Mark as fatal
+                                            
+                                            if is_reservation_conflict:
+                                                logging.info(f"Identified reservation conflict for {class_name} ({event_id}): '{notification_msg_from_api}'. Treating as fatal.")
+                                            
+                                            # Only check for 'tooSoonRule' if it's a generic fatal error from API AND NOT the specific conflict
+                                            if not is_reservation_conflict and validation_info.get("isFatal", False):
+                                                rules = validation_info.get("rules", {})
+                                                if rules.get("tooSoonRule", {}).get("errorCode") == 40:
+                                                    is_too_soon_from_api = True
+                                                    # The logging for 'tooSoon' will happen in the dedicated block below
                                 
                                 if is_too_soon_from_api:
                                     logging.info(f"API indicates 'Too Soon' for {class_name} ({event_id}): {final_reg_message}. Will not retry in this attempt cycle. Main loop will re-evaluate.")
                                     event_processed_this_cycle = False # Do not mark as processed, let main loop try again later
                                     break # Break from retry loop, but DON'T add to processed_event_ids
-                                elif is_fatal_from_api: # Other fatal errors (e.g., already registered, ineligible)
+                                elif is_fatal_from_api: # Other fatal errors (e.g., already registered, ineligible, or the identified reservation conflict)
                                     logging.warning(f"Ineligible/Fatal API Error for {class_name} ({event_id}): {final_reg_message}. No more retries.")
                                     event_processed_this_cycle = True # Mark as processed
-                                    subject = f"NOT Registered (Ineligible): {class_name}"
-                                    body = f"Could not register for: {class_name} on {activity.get('date')} {activity.get('start_time')}.\nReason: {final_reg_message}"
+                                    subject = f"NOT Registered (Ineligible/Conflict): {class_name}" # Updated subject
+                                    body = f"Could not register for: {class_name} on {activity.get('date')} {activity.get('start_time')}.
+Reason: {final_reg_message}"
                                     if notification_sender.send_sms_notification(body, subject, SMS_RECIPIENT_EMAIL, EMAIL_SENDER, EMAIL_PASSWORD, SMTP_SERVER, SMTP_PORT):
-                                        logging.info(f"Ineligibility notification sent for {class_name}.")
+                                        logging.info(f"Ineligibility/conflict notification sent for {class_name}.")
                                     break # Break from retry loop
                                 else: # Non-fatal, retryable error
                                     logging.warning(f"FAILED Attempt {retry_count + 1}/{MAX_REGISTRATION_RETRIES} for {class_name} ({event_id}). Msg: {final_reg_message}")
