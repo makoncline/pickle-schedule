@@ -53,23 +53,24 @@ def attempt_event_registration(event_id, member_ids, jwe_token, ssoid_token, lif
         lifetime_registration_module: The imported lifetime_registration module.
 
     Returns:
-        tuple: (success_flag (bool), message (str), response_data (dict or None))
+        tuple: (success_flag (bool), message (str), response_data (dict or None), step1_status_code (int or None))
                success_flag is True if registration completed successfully.
                message provides a human-readable status.
                response_data contains the final API response or relevant error info.
+               step1_status_code is the HTTP status code from Step 1 (for 401 detection) or None if not applicable.
     """
     print(f"\nAttempting registration for Event ID: {event_id} with Members: {member_ids}")
 
     # Get headers for Step 1
     step1_headers = get_request_headers(jwe_token, ssoid_token)
     if not step1_headers:
-        return False, "Failed to construct headers for Step 1 (Initiate Registration).", None
+        return False, "Failed to construct headers for Step 1 (Initiate Registration).", None, None
 
     # Execute Step 1: Initiate Registration
     try:
         step1_result = lifetime_registration_module.initiate_registration(event_id, member_ids, step1_headers)
     except Exception as e:
-        return False, f"Error during Step 1 (Initiate Registration): {str(e)}", None
+        return False, f"Error during Step 1 (Initiate Registration): {str(e)}", None, None
         
     reg_id = step1_result.get("regId")
     agreement_id = step1_result.get("agreementId")
@@ -77,6 +78,15 @@ def attempt_event_registration(event_id, member_ids, jwe_token, ssoid_token, lif
     step1_error = step1_result.get("error")
     is_fatal = step1_response_data.get("validation", {}).get("isFatal", False) if isinstance(step1_response_data, dict) else False
     notification = step1_response_data.get("validation", {}).get("notification") if isinstance(step1_response_data, dict) else None
+    # Extract status code from step1_result if present (for 401 detection)
+    step1_status_code = None
+    if isinstance(step1_response_data, dict) and 'status' in step1_response_data:
+        step1_status_code = step1_response_data.get('status')
+    elif step1_error and 'HTTP Error:' in step1_error:
+        try:
+            step1_status_code = int(step1_error.split('HTTP Error:')[1].strip())
+        except Exception:
+            step1_status_code = None
 
     if not (reg_id and agreement_id and not is_fatal):
         message = f"Step 1 (Initiate Registration) FAILED or conditions not met for Step 2."
@@ -87,18 +97,17 @@ def attempt_event_registration(event_id, member_ids, jwe_token, ssoid_token, lif
         elif not reg_id:
              message += " Reason: Missing registration ID from Step 1 response."
         elif not agreement_id:
-             # This might not always be fatal if no waiver is needed, but the original script implied it was important.
              message += " Reason: Missing agreement ID from Step 1 response."
         else:
              message += " Reason: Unknown Step 1 failure."
-        return False, message, step1_response_data
+        return False, message, step1_response_data, step1_status_code
 
     print(f"Step 1 successful (Reg ID: {reg_id}). Proceeding to Step 2.")
             
     # Get headers for Step 2 (regenerate for fresh timestamp)
     step2_headers = get_request_headers(jwe_token, ssoid_token)
     if not step2_headers:
-        return False, "Failed to construct headers for Step 2 (Complete Registration).", None
+        return False, "Failed to construct headers for Step 2 (Complete Registration).", None, None
 
     # Execute Step 2: Complete Registration
     try:
@@ -106,16 +115,16 @@ def attempt_event_registration(event_id, member_ids, jwe_token, ssoid_token, lif
             reg_id, member_ids, agreement_id, step2_headers
         )
     except Exception as e:
-        return False, f"Error during Step 2 (Complete Registration): {str(e)}", None
+        return False, f"Error during Step 2 (Complete Registration): {str(e)}", None, None
             
     if step2_success:
         msg = f"Registration COMPLETED successfully for Event ID: {event_id}, Members: {member_ids}."
         print(msg)
-        return True, msg, step2_response
+        return True, msg, step2_response, step2_status
     else:
         msg = f"Step 2 (Complete Registration) FAILED for Event ID: {event_id}. Status: {step2_status}"
         print(msg)
-        return False, msg, step2_response
+        return False, msg, step2_response, step2_status
 
 # Example of how this might be tested if lifetime_registration was available
 # and we had live tokens and a valid event ID.
@@ -156,7 +165,7 @@ if __name__ == "__main__":
     if not test_jwe or not test_ssoid:
         print("Please provide dummy JWE and SSOID tokens for testing this module.")
     else:
-        success, message, data = attempt_event_registration(
+        success, message, data, step1_status_code = attempt_event_registration(
             test_event_id, 
             test_member_ids, 
             test_jwe, 
@@ -169,4 +178,5 @@ if __name__ == "__main__":
         print(f"Message: {message}")
         if data:
             print(f"Response Data: {json.dumps(data, indent=2)}")
+        print(f"Step 1 Status Code: {step1_status_code}")
         print("---------------------") 
